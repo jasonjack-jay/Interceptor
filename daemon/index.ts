@@ -898,7 +898,7 @@ try {
 
         while (buf.length >= 4) {
           const msgLen = buf.readUInt32LE(0)
-          if (msgLen === 0 || msgLen > 1024 * 1024) {
+          if (msgLen === 0 || msgLen > 50 * 1024 * 1024) {
             log(`invalid socket message length: ${msgLen}, discarding`)
             buf = Buffer.alloc(0)
             break

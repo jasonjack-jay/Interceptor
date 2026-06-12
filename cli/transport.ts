@@ -78,7 +78,7 @@ export function sendCommand(action: Action, tabId?: number, contextId?: string):
         buffer = Buffer.concat([buffer, Buffer.from(raw)])
         if (buffer.length >= 4) {
           const msgLen = buffer.readUInt32LE(0)
-          if (msgLen > 0 && msgLen <= 1024 * 1024 && buffer.length >= 4 + msgLen) {
+          if (msgLen > 0 && msgLen <= 50 * 1024 * 1024 && buffer.length >= 4 + msgLen) {
             const json = buffer.subarray(4, 4 + msgLen).toString("utf-8")
             clearTimeout(timer)
             try {

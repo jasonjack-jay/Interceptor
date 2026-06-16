@@ -203,12 +203,23 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
         DispatchQueue.global().async { [self] in
             for char in text {
                 let utf16 = Array(String(char).utf16)
-                if let downEvent = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+                // Carry a real virtualKey (not 0) plus the unicode string.
+                // Cocoa apps read the unicode string; apps that key off the
+                // hardware keycode instead — notably the iOS Simulator — read
+                // virtualKey. Sending 0 made every char register as "a" there.
+                // For chars we can't map (emoji, accented), fall back to
+                // virtualKey 0 + unicode string (Cocoa-only, prior behavior).
+                let mapped = Self.typeKeyCode(for: char)
+                let vk = mapped?.0 ?? 0
+                let needsShift = mapped?.1 ?? false
+                if let downEvent = CGEvent(keyboardEventSource: source, virtualKey: vk, keyDown: true) {
+                    if needsShift { downEvent.flags.insert(.maskShift) }
                     downEvent.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
                     post(downEvent, on: postTarget)
                 }
                 usleep(3000)
-                if let upEvent = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                if let upEvent = CGEvent(keyboardEventSource: source, virtualKey: vk, keyDown: false) {
+                    if needsShift { upEvent.flags.insert(.maskShift) }
                     upEvent.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
                     post(upEvent, on: postTarget)
                 }
@@ -256,6 +267,33 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
         "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
         "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
     ]
+
+    // US-layout shifted symbols → the unshifted key they live on. Lets typed
+    // symbols and uppercase carry a real virtualKey + shift, so keycode-reading
+    // targets (iOS Simulator) get the right character, not "a".
+    private static let shiftedSymbols: [Character: Character] = [
+        "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+        "*": "8", "(": "9", ")": "0", "_": "-", "+": "=", "{": "[", "}": "]",
+        "|": "\\", ":": ";", "\"": "'", "<": ",", ">": ".", "?": "/", "~": "`",
+    ]
+
+    // Maps a printable character to its (virtualKey, needsShift) on the US
+    // layout. Returns nil for characters with no single-key mapping (emoji,
+    // accented letters) so the caller can fall back to unicode-string-only.
+    static func typeKeyCode(for char: Character) -> (CGKeyCode, Bool)? {
+        // Lowercase letters and unshifted symbols/digits sit directly in keyMap.
+        if let code = keyMap[String(char)] { return (code, false) }
+        // Uppercase letter → its lowercase key + shift.
+        if char.isLetter, char.isUppercase {
+            let lower = Character(char.lowercased())
+            if let code = keyMap[String(lower)] { return (code, true) }
+        }
+        // Shifted symbol → its base key + shift.
+        if let base = shiftedSymbols[char], let code = keyMap[String(base)] {
+            return (code, true)
+        }
+        return nil
+    }
 
     private func handleKeys(_ action: [String: Any], completion: @escaping @Sendable ([String: Any]) -> Void) {
         guard let keys = action["keys"] as? String else {

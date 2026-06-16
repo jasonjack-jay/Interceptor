@@ -208,13 +208,23 @@ final class AccessibilityDomain: DomainHandler, @unchecked Sendable {
         let searchRoot = searchRootElement(for: axApp) ?? axApp
 
         var matches: [[String: Any]] = []
-        findElements(element: searchRoot, pid: pid, query: query.lowercased(), roleFilter: roleFilter?.lowercased(), depth: 0, maxDepth: 15, maxMatches: 25, matches: &matches)
+        // Bound the search: apps with very large/slow AX trees (notably the
+        // iOS Simulator, whose bridged tree is enormous) would otherwise make
+        // a no-match traversal run past the CLI's 15s request timeout and hang.
+        // An 8s wall-clock deadline + node budget returns whatever was found so
+        // far instead — fast, honest, and never a silent hang.
+        let deadline = Date().addingTimeInterval(8.0)
+        var visited = 0
+        findElements(element: searchRoot, pid: pid, query: query.lowercased(), roleFilter: roleFilter?.lowercased(), depth: 0, maxDepth: 15, maxMatches: 25, matches: &matches, deadline: deadline, visited: &visited, maxNodes: 6000)
 
         completion(WireFormat.success(matches))
     }
 
-    private func findElements(element: AXUIElement, pid: pid_t, query: String, roleFilter: String?, depth: Int, maxDepth: Int, maxMatches: Int, matches: inout [[String: Any]]) {
+    private func findElements(element: AXUIElement, pid: pid_t, query: String, roleFilter: String?, depth: Int, maxDepth: Int, maxMatches: Int, matches: inout [[String: Any]], deadline: Date, visited: inout Int, maxNodes: Int) {
         guard depth < maxDepth, matches.count < maxMatches else { return }
+        // Stop if we've spent the time budget or visited too many nodes.
+        guard visited < maxNodes, Date() < deadline else { return }
+        visited += 1
 
         let role = getStringAttribute(element, kAXRoleAttribute as CFString) ?? ""
         let identifier = getStringAttribute(element, kAXIdentifierAttribute as CFString) ?? ""
@@ -255,7 +265,8 @@ final class AccessibilityDomain: DomainHandler, @unchecked Sendable {
         guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
               let childArray = children as? [AXUIElement] else { return }
         for child in childArray {
-            findElements(element: child, pid: pid, query: query, roleFilter: roleFilter, depth: depth + 1, maxDepth: maxDepth, maxMatches: maxMatches, matches: &matches)
+            if matches.count >= maxMatches || visited >= maxNodes || Date() >= deadline { return }
+            findElements(element: child, pid: pid, query: query, roleFilter: roleFilter, depth: depth + 1, maxDepth: maxDepth, maxMatches: maxMatches, matches: &matches, deadline: deadline, visited: &visited, maxNodes: maxNodes)
         }
     }
 

@@ -58,26 +58,46 @@ final class ThumbnailDomain: DomainHandler, @unchecked Sendable {
         let scale = (action["scale"] as? Int).map { CGFloat($0) } ?? 2
         let types = parseTypes(action["types"] as? String)
         let request = QLThumbnailGenerator.Request(fileAt: url, size: size, scale: scale, representationTypes: types)
-        let save = (action["save"] as? Bool) ?? false
         let outRequested = action["out"] as? String
-        let (formatName, contentType, ext) = format(action["format"] as? String)
+        // --out implies save. Previously --out without --save fell through to
+        // the dataUrl branch and silently never wrote the file.
+        let save = ((action["save"] as? Bool) ?? false) || (outRequested != nil)
+        let (formatName, _, ext) = format(action["format"] as? String)
 
         if save {
             let outURL: URL = {
                 if let o = outRequested { return URL(fileURLWithPath: (o as NSString).expandingTildeInPath) }
                 return url.appendingPathExtension("thumb.\(ext)")
             }()
-            QLThumbnailGenerator.shared.saveBestRepresentation(for: request, to: outURL, contentType: contentType as String) { error in
+            // Generate the representation and write the file ourselves instead
+            // of QLThumbnailGenerator.saveBestRepresentation — that API routes
+            // through a QuickLook service that the bridge can't write from
+            // (EPERM "Operation not permitted"), even to /tmp. Encoding + a plain
+            // Data.write uses the bridge's own file access, exactly like the
+            // screenshot path which writes reliably.
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { thumbnail, error in
                 if let error = error {
-                    completion(WireFormat.error("thumbnail.save: \(error.localizedDescription)"))
+                    completion(WireFormat.error("thumbnail: \(error.localizedDescription)"))
                     return
                 }
-                let attrs = (try? FileManager.default.attributesOfItem(atPath: outURL.path)) ?? [:]
-                let bytes = (attrs[.size] as? Int) ?? 0
+                guard let thumbnail = thumbnail else {
+                    completion(WireFormat.error("thumbnail: no representation"))
+                    return
+                }
+                guard let data = self.encode(thumbnail.nsImage, format: formatName) else {
+                    completion(WireFormat.error("thumbnail: encode failed"))
+                    return
+                }
+                do {
+                    try data.write(to: outURL)
+                } catch {
+                    completion(WireFormat.error("thumbnail.save failed writing to \(outURL.path): \(error.localizedDescription) — pass an absolute --out under a writable directory (e.g. /tmp or ~/Downloads)"))
+                    return
+                }
                 completion(WireFormat.success([
                     "path": path, "type": "thumbnail", "filePath": outURL.path,
-                    "format": formatName, "bytes": bytes,
-                    "width": Int(size.width * scale), "height": Int(size.height * scale), "scale": Int(scale),
+                    "format": formatName, "bytes": data.count,
+                    "width": Int(thumbnail.cgImage.width), "height": Int(thumbnail.cgImage.height), "scale": Int(scale),
                 ]))
             }
         } else {

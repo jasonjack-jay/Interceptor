@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ApplicationServices
 
 final class AppsDomain: DomainHandler, @unchecked Sendable {
     private struct FrontmostInfo {
@@ -105,6 +106,55 @@ final class AppsDomain: DomainHandler, @unchecked Sendable {
                 }
             } else {
                 completion(WireFormat.error("no app found for bundle ID: \(bundleId)"))
+            }
+        case "move", "resize":
+            let name = action["app"] as? String
+            let pid = action["pid"] as? Int32
+            guard let app = resolveApp(name: name, pid: pid) else {
+                completion(WireFormat.error("app not found"))
+                return
+            }
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var winRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &winRef) == .success,
+                  let win = winRef, CFGetTypeID(win) == AXUIElementGetTypeID() else {
+                completion(WireFormat.error("could not resolve a main window for \(app.localizedName ?? "app") — it may have no open window"))
+                return
+            }
+            let axWindow = win as! AXUIElement
+            func toCGFloat(_ v: Any?) -> CGFloat? {
+                if let i = v as? Int { return CGFloat(i) }
+                if let d = v as? Double { return CGFloat(d) }
+                return nil
+            }
+            if subcommand == "move" {
+                guard let x = toCGFloat(action["x"]), let y = toCGFloat(action["y"]) else {
+                    completion(WireFormat.error("app move requires x and y (e.g. 'app move \"\(app.localizedName ?? "App")\" 100 80')"))
+                    return
+                }
+                var point = CGPoint(x: x, y: y)
+                guard let value = AXValueCreate(.cgPoint, &point) else {
+                    completion(WireFormat.error("failed to create position value")); return
+                }
+                let err = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, value)
+                guard err == .success else {
+                    completion(WireFormat.error("could not move window (AX error \(err.rawValue)) — the window may be fullscreen or non-movable")); return
+                }
+                completion(WireFormat.success("moved \(app.localizedName ?? "app") window to (\(Int(x)),\(Int(y)))"))
+            } else {
+                guard let w = toCGFloat(action["width"]), let h = toCGFloat(action["height"]) else {
+                    completion(WireFormat.error("app resize requires width and height (e.g. 'app resize \"\(app.localizedName ?? "App")\" 1280 800')"))
+                    return
+                }
+                var size = CGSize(width: w, height: h)
+                guard let value = AXValueCreate(.cgSize, &size) else {
+                    completion(WireFormat.error("failed to create size value")); return
+                }
+                let err = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, value)
+                guard err == .success else {
+                    completion(WireFormat.error("could not resize window (AX error \(err.rawValue)) — the window may be fullscreen or non-resizable")); return
+                }
+                completion(WireFormat.success("resized \(app.localizedName ?? "app") window to \(Int(w))x\(Int(h))"))
             }
         default:
             notImplemented("app \(subcommand)", completion: completion)

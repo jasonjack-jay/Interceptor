@@ -305,13 +305,28 @@ export function parseMacosCommand(filtered: string[]): Action | null {
     case "app": {
       const subcommand = filtered[2] || "activate"
       const appName = flagVal(filtered, "--app") || filtered[3]
-      return {
+      const action: Action = {
         type: "macos_app",
         subcommand,
         app: appName,
         pid: flagInt(filtered, "--pid"),
         bundleId: subcommand === "launch" ? (filtered[3] || flagVal(filtered, "--bundle")) : undefined,
       }
+      // app move <name> <x> <y>  /  app resize <name> <w> <h> — also accept
+      // --x/--y/--width/--height. Positionals start at filtered[4] (after the
+      // app name at filtered[3]).
+      if (subcommand === "move") {
+        const x = flagInt(filtered, "--x") ?? (filtered[4] !== undefined ? parseInt(filtered[4], 10) : undefined)
+        const y = flagInt(filtered, "--y") ?? (filtered[5] !== undefined ? parseInt(filtered[5], 10) : undefined)
+        if (x !== undefined && !Number.isNaN(x)) action.x = x
+        if (y !== undefined && !Number.isNaN(y)) action.y = y
+      } else if (subcommand === "resize") {
+        const w = flagInt(filtered, "--width") ?? (filtered[4] !== undefined ? parseInt(filtered[4], 10) : undefined)
+        const h = flagInt(filtered, "--height") ?? (filtered[5] !== undefined ? parseInt(filtered[5], 10) : undefined)
+        if (w !== undefined && !Number.isNaN(w)) action.width = w
+        if (h !== undefined && !Number.isNaN(h)) action.height = h
+      }
+      return action
     }
 
     case "frontmost":

@@ -6,7 +6,10 @@
 # a symlink so older callers keep working.
 #
 # Env overrides:
-#   INTERCEPTOR_SIGNING_IDENTITY  codesign identity (default: HVM Developer ID)
+#   INTERCEPTOR_SIGNING_IDENTITY  codesign identity (default: HVM Developer ID;
+#                                 if absent, auto-picks a local Apple Development
+#                                 / Developer ID identity so TCC grants persist
+#                                 across rebuilds instead of ad-hoc churn)
 #   INTERCEPTOR_BRIDGE_VERSION    version string in Info.plist (default 1.0.0)
 #   INTERCEPTOR_SKIP_SIGNING=1    skip codesign + lsregister (dev mode)
 
@@ -17,7 +20,26 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BRIDGE_DIR="$PROJECT_DIR/interceptor-bridge"
 DIST_DIR="$PROJECT_DIR/dist"
 
+INTERCEPTOR_SIGNING_IDENTITY_EXPLICIT="${INTERCEPTOR_SIGNING_IDENTITY:+1}"
 INTERCEPTOR_SIGNING_IDENTITY="${INTERCEPTOR_SIGNING_IDENTITY:-Developer ID Application: HACKER VALLEY MEDIA, LLC (TPWBZD35WW)}"
+
+# Stable signing for local/fork development. If the configured identity isn't in
+# the keychain and the user didn't set one explicitly, auto-pick a local
+# codesigning identity (Apple Development / Developer ID) rather than falling
+# back to ad-hoc. Ad-hoc gives a NEW code identity on every build, which makes
+# macOS reset ALL TCC grants (Accessibility / Screen Recording / Microphone)
+# each rebuild — a constant re-granting tax during development. A stable
+# identity keeps the designated requirement constant so grants persist across
+# rebuilds. Override anytime via INTERCEPTOR_SIGNING_IDENTITY.
+if [[ -z "$INTERCEPTOR_SIGNING_IDENTITY_EXPLICIT" ]] \
+   && ! security find-identity -p codesigning -v 2>/dev/null | grep -q "$INTERCEPTOR_SIGNING_IDENTITY"; then
+  AUTO_SIGN_IDENTITY="$(security find-identity -p codesigning -v 2>/dev/null \
+    | grep -oE '"(Apple Development|Developer ID Application)[^"]*"' | head -1 | tr -d '"')"
+  if [[ -n "$AUTO_SIGN_IDENTITY" ]]; then
+    echo "==> Configured identity absent; auto-selecting local identity for stable TCC: $AUTO_SIGN_IDENTITY"
+    INTERCEPTOR_SIGNING_IDENTITY="$AUTO_SIGN_IDENTITY"
+  fi
+fi
 INTERCEPTOR_BRIDGE_IDENTIFIER="com.interceptor.bridge"
 INTERCEPTOR_BRIDGE_VERSION="${INTERCEPTOR_BRIDGE_VERSION:-1.0.0}"
 INTERCEPTOR_SPARKLE_FEED_URL="${INTERCEPTOR_SPARKLE_FEED_URL:-https://updates.hackervalley.media/appcast.xml}"
@@ -264,8 +286,11 @@ else
 
     codesign --verify --strict --verbose=2 "$APP_DIR" || true
   else
-    echo "==> Signing identity not present in keychain — performing ad-hoc sign for development."
-    echo "    Set INTERCEPTOR_SIGNING_IDENTITY to a real Developer ID for distribution."
+    echo "==> No codesigning identity available — performing ad-hoc sign."
+    echo "    WARNING: ad-hoc signing changes the bridge's code identity every"
+    echo "    build, so macOS resets Accessibility / Screen Recording / Microphone"
+    echo "    grants on each rebuild. Add an Apple Development cert to your keychain"
+    echo "    (or set INTERCEPTOR_SIGNING_IDENTITY) for stable, persistent TCC."
     if [ -d "$APP_DIR/Contents/Frameworks/Sparkle.framework" ]; then
       codesign --force --deep --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
     fi

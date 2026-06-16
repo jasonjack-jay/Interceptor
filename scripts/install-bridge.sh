@@ -75,6 +75,15 @@ if [[ -f /tmp/interceptor-bridge.pid ]]; then
   sleep 1
 fi
 
+# Belt-and-suspenders: kill any bridge process the bootout/pidfile path missed
+# — e.g. an instance launched via `open -gj` outside launchd, or a leftover
+# duplicate. Without this, the freshly-bootstrapped agent finds an OLD binary
+# already alive (KeepAlive won't relaunch what's already running), so a rebuild
+# silently keeps serving the previous build. Observed exactly this during dev:
+# install reported success but the running pid predated the new binary.
+pkill -f "interceptor-bridge.app/Contents/MacOS/interceptor-bridge" 2>/dev/null || true
+sleep 1
+
 # install the .app bundle for TCC tracking, then a back-compat symlink
 # at the legacy bare-binary path. INTERCEPTOR_BRIDGE_BIN override skips this
 # whole block — power users keep their own layout.

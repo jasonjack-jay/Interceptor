@@ -221,52 +221,60 @@ final class AccessibilityDomain: DomainHandler, @unchecked Sendable {
     }
 
     private func findElements(element: AXUIElement, pid: pid_t, query: String, roleFilter: String?, depth: Int, maxDepth: Int, maxMatches: Int, matches: inout [[String: Any]], deadline: Date, visited: inout Int, maxNodes: Int) {
-        guard depth < maxDepth, matches.count < maxMatches else { return }
-        // Stop if we've spent the time budget or visited too many nodes.
-        guard visited < maxNodes, Date() < deadline else { return }
-        visited += 1
-
-        let role = getStringAttribute(element, kAXRoleAttribute as CFString) ?? ""
-        let identifier = getStringAttribute(element, kAXIdentifierAttribute as CFString) ?? ""
-        let roleDescription = getStringAttribute(element, kAXRoleDescriptionAttribute as CFString) ?? ""
-        let title = getStringAttribute(element, kAXTitleAttribute as CFString) ?? ""
-        let desc = getStringAttribute(element, kAXDescriptionAttribute as CFString) ?? ""
-        let value = getStringAttribute(element, kAXValueAttribute as CFString) ?? ""
-
-        let displayRole = role.replacingOccurrences(of: "AX", with: "").lowercased()
-        let searchable = Self.buildSearchableText(
-            title: title,
-            description: desc,
-            value: value,
-            identifier: identifier,
-            roleDescription: roleDescription,
-            displayRole: displayRole
-        )
-
-        if searchable.contains(query) {
-            if roleFilter == nil || displayRole.contains(roleFilter!) {
-                let ref = refRegistry.register(element, pid: pid)
-                var match: [String: Any] = [
-                    "ref": ref,
-                    "role": displayRole,
-                    "name": title.isEmpty ? desc : title
-                ]
-                if !value.isEmpty { match["value"] = value }
-                if !identifier.isEmpty { match["identifier"] = identifier }
-                if let frame = getFrame(element) {
-                    match["frame"] = ["x": frame.origin.x, "y": frame.origin.y,
-                                     "width": frame.size.width, "height": frame.size.height]
-                }
-                matches.append(match)
-            }
-        }
-
-        var children: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-              let childArray = children as? [AXUIElement] else { return }
-        for child in childArray {
+        // Breadth-first traversal. Shallow targets (toolbar buttons, menu items,
+        // alert buttons) are what callers usually search for, and they sit near
+        // the root. Depth-first would pour the whole time/node budget into the
+        // first large subtree (file lists, web content) and return empty before
+        // ever reaching them — exactly the "8s then []" failure on Finder.
+        var queue: [(AXUIElement, Int)] = [(element, depth)]
+        var head = 0
+        while head < queue.count {
             if matches.count >= maxMatches || visited >= maxNodes || Date() >= deadline { return }
-            findElements(element: child, pid: pid, query: query, roleFilter: roleFilter, depth: depth + 1, maxDepth: maxDepth, maxMatches: maxMatches, matches: &matches, deadline: deadline, visited: &visited, maxNodes: maxNodes)
+            let (node, d) = queue[head]
+            head += 1
+            if d >= maxDepth { continue }
+            visited += 1
+
+            let role = getStringAttribute(node, kAXRoleAttribute as CFString) ?? ""
+            let identifier = getStringAttribute(node, kAXIdentifierAttribute as CFString) ?? ""
+            let roleDescription = getStringAttribute(node, kAXRoleDescriptionAttribute as CFString) ?? ""
+            let title = getStringAttribute(node, kAXTitleAttribute as CFString) ?? ""
+            let desc = getStringAttribute(node, kAXDescriptionAttribute as CFString) ?? ""
+            let value = getStringAttribute(node, kAXValueAttribute as CFString) ?? ""
+
+            let displayRole = role.replacingOccurrences(of: "AX", with: "").lowercased()
+            let searchable = Self.buildSearchableText(
+                title: title,
+                description: desc,
+                value: value,
+                identifier: identifier,
+                roleDescription: roleDescription,
+                displayRole: displayRole
+            )
+
+            if searchable.contains(query) {
+                if roleFilter == nil || displayRole.contains(roleFilter!) {
+                    let ref = refRegistry.register(node, pid: pid)
+                    var match: [String: Any] = [
+                        "ref": ref,
+                        "role": displayRole,
+                        "name": title.isEmpty ? desc : title
+                    ]
+                    if !value.isEmpty { match["value"] = value }
+                    if !identifier.isEmpty { match["identifier"] = identifier }
+                    if let frame = getFrame(node) {
+                        match["frame"] = ["x": frame.origin.x, "y": frame.origin.y,
+                                         "width": frame.size.width, "height": frame.size.height]
+                    }
+                    matches.append(match)
+                }
+            }
+
+            var children: CFTypeRef?
+            if AXUIElementCopyAttributeValue(node, kAXChildrenAttribute as CFString, &children) == .success,
+               let childArray = children as? [AXUIElement] {
+                for child in childArray { queue.append((child, d + 1)) }
+            }
         }
     }
 

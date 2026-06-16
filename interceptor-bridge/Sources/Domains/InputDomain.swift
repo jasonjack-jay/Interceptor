@@ -71,6 +71,14 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
         }
     }
 
+    // Label for cghidEventTap routing. HID input follows the frontmost app, so
+    // naming it in the response makes "where did this actually land?" answerable
+    // — focus can drift mid-flow, and a bare "frontmost" hides that.
+    private static func frontmostLabel() -> String {
+        let name = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        return "frontmost (\(name))"
+    }
+
     // MARK: - Click
 
     private func handleClick(_ action: [String: Any], completion: @escaping @Sendable ([String: Any]) -> Void) {
@@ -141,7 +149,7 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
                     let routing: String
                     switch postTarget {
                     case .postToPid(let pid): routing = "pid=\(pid)"
-                    case .cghidEventTap: routing = "frontmost"
+                    case .cghidEventTap: routing = Self.frontmostLabel()
                     case .axPress: routing = "ax"
                     }
                     completion(WireFormat.success("clicked at (\(Int(point.x)), \(Int(point.y))) → \(routing)"))
@@ -228,7 +236,7 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
             let routing: String
             switch postTarget {
             case .postToPid(let pid): routing = "pid=\(pid)"
-            case .cghidEventTap: routing = "frontmost"
+            case .cghidEventTap: routing = Self.frontmostLabel()
             case .axPress: routing = "ax"
             }
             completion(WireFormat.success("typed \(text.count) characters → \(routing)"))
@@ -373,7 +381,7 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
             let routing: String
             switch postTarget {
             case .postToPid(let pid): routing = "pid=\(pid)"
-            case .cghidEventTap: routing = "frontmost"
+            case .cghidEventTap: routing = Self.frontmostLabel()
             case .axPress: routing = "ax"
             }
             completion(WireFormat.success("sent keys: \(keys) → \(routing)"))
@@ -434,7 +442,7 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
                 usleep(useconds_t(intervalMs * 1000))
             }
         }
-        let routing = pidFromAction.map { "pid=\($0)" } ?? "frontmost"
+        let routing = pidFromAction.map { "pid=\($0)" } ?? Self.frontmostLabel()
         completion(WireFormat.success("scrolled \(direction) \(amount)x\(times) → \(routing)"))
     }
 
@@ -526,7 +534,7 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
             let routing: String
             switch target {
             case .postToPid(let pid): routing = "pid=\(pid)"
-            case .cghidEventTap: routing = "frontmost"
+            case .cghidEventTap: routing = Self.frontmostLabel()
             case .axPress: routing = "ax"
             }
             completion(WireFormat.success("dragged from (\(Int(from.x)),\(Int(from.y))) to (\(Int(to.x)),\(Int(to.y))) → \(routing)"))

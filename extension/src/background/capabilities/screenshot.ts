@@ -4,6 +4,10 @@ import { installScreenshotCorsRule, uninstallScreenshotCorsRule } from "./screen
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
+// Shape returned by the content-script `dom_screenshot` handler (dom-screenshot.ts).
+type DomRenderData = { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string }
+type DomRenderResponse = { success: boolean; error?: string; data?: DomRenderData }
+
 const CAPTURE_TIMEOUT_MS = 5000
 const DOM_RENDER_TIMEOUT_MS = 30_000
 const VISIBILITY_HINT = "Chrome/Brave window may not be visible — bring it to the front and retry, or pass --tab <id> of a tab in a visible window."
@@ -217,7 +221,43 @@ async function handleDomRenderScreenshot(
     if (scale !== undefined) dsAction.scale = scale
     if (targetMaxLongEdge !== undefined) dsAction.target_max_long_edge = targetMaxLongEdge
 
-    const renderResult = await sendToContentScript(tabId, dsAction) as { success: boolean; error?: string; data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string } }
+    // html-to-image serializes the DOM into an SVG and decodes it through an
+    // <img>. Chrome suspends image decoding and rAF in BACKGROUND (non-active)
+    // tabs, so that decode never resolves and the render promise hangs forever —
+    // which previously surfaced only as an opaque CLI socket timeout with no
+    // explanation. Two guarantees make this path trustworthy:
+    //   1. Borrow focus for the render (same pattern as the --pixel path) so the
+    //      target tab is the active, decoding tab while html-to-image runs, then
+    //      restore whatever the user was looking at. `withCaptureVisibleTabFocus`
+    //      no-ops (no flash) when the tab is already active, so foreground
+    //      screenshots are unaffected; background tabs flash once instead of
+    //      hanging.
+    //   2. Bound the render with DOM_RENDER_TIMEOUT_MS so a genuine stall fails
+    //      fast with a hint the caller can act on, rather than riding the CLI
+    //      socket timeout into a generic "no response" error.
+    let renderResult: DomRenderResponse
+    try {
+      renderResult = await withCaptureVisibleTabFocus(tabId, targetTab.windowId, () =>
+        withCaptureTimeout<DomRenderResponse>(
+          "dom-render",
+          sendToContentScript(tabId, dsAction) as Promise<DomRenderResponse>,
+          DOM_RENDER_TIMEOUT_MS
+        )
+      )
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) {
+        return {
+          success: false,
+          error: `DOM-render screenshot timed out after ${err.timeoutMs}ms — the page never finished rasterizing.`,
+          data: {
+            hint: "Try a smaller scope (--selector \"<css>\" or --region X,Y,W,H), or use --pixel for a fast compositor capture. Very large or resource-heavy pages can exceed the render budget.",
+            layer: "dom-render",
+            timedOutAt: err.operation
+          }
+        }
+      }
+      throw err
+    }
 
     if (!renderResult || !renderResult.success || !renderResult.data) {
       return { success: false, error: renderResult?.error || "dom render returned no data" }

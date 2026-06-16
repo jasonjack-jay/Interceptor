@@ -114,7 +114,7 @@ Tabs:
   interceptor tab switch <id>                Switch to tab (explicit focus move)
 
 Capture:
-  interceptor screenshot                     Full-page DOM-render screenshot (default — works without focus)
+  interceptor screenshot                     Full-page DOM-render screenshot (default — briefly activates a background tab to render, then restores your tab)
   interceptor screenshot --selector "h1"    Capture only the matching element
   interceptor screenshot --element N         Capture element by ref (off-screen elements supported)
   interceptor screenshot --region X,Y,W,H   Capture page region (rendered + cropped)

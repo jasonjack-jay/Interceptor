@@ -208,6 +208,13 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
             postTarget = .cghidEventTap
         }
 
+        // Left Shift virtual keycode. Keycode-reading targets (the iOS Simulator)
+        // need a real Shift key-down/up bracketing the character — the .maskShift
+        // event flag alone is ignored there, so uppercase/shifted chars arrived
+        // lowercase ("BN13" → "bn13", then iOS auto-capitalised the first letter
+        // → "Bn13"). Cocoa apps read the unicode string and ignore the extra
+        // modifier events, so they are unaffected.
+        let shiftKey: CGKeyCode = 56
         DispatchQueue.global().async { [self] in
             for char in text {
                 let utf16 = Array(String(char).utf16)
@@ -220,6 +227,11 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
                 let mapped = Self.typeKeyCode(for: char)
                 let vk = mapped?.0 ?? 0
                 let needsShift = mapped?.1 ?? false
+                if needsShift, let shiftDown = CGEvent(keyboardEventSource: source, virtualKey: shiftKey, keyDown: true) {
+                    shiftDown.flags.insert(.maskShift)
+                    post(shiftDown, on: postTarget)
+                    usleep(1000)
+                }
                 if let downEvent = CGEvent(keyboardEventSource: source, virtualKey: vk, keyDown: true) {
                     if needsShift { downEvent.flags.insert(.maskShift) }
                     downEvent.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
@@ -230,6 +242,10 @@ final class InputDomain: DomainHandler, @unchecked Sendable {
                     if needsShift { upEvent.flags.insert(.maskShift) }
                     upEvent.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
                     post(upEvent, on: postTarget)
+                }
+                if needsShift, let shiftUp = CGEvent(keyboardEventSource: source, virtualKey: shiftKey, keyDown: false) {
+                    usleep(1000)
+                    post(shiftUp, on: postTarget)
                 }
                 usleep(8000)
             }

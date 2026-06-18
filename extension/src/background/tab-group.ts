@@ -11,8 +11,15 @@ export async function ensureInterceptorGroup(): Promise<number> {
   }
   const groups = await chrome.tabGroups.query({ title: "interceptor" })
   if (groups.length > 0) {
-    interceptorGroupId = groups[0].id
-    return interceptorGroupId
+    // Only rediscover if the group has at least one tab. An empty group label
+    // persists briefly after the last tab closes; treating it as "exists" sets
+    // interceptorGroupId non-null and causes the unmanaged-tab guard to fire
+    // for every subsequent command on a real tab.
+    const tabs = await chrome.tabs.query({ groupId: groups[0].id })
+    if (tabs.length > 0) {
+      interceptorGroupId = groups[0].id
+      return interceptorGroupId
+    }
   }
   return -1
 }

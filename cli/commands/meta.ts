@@ -73,12 +73,15 @@ export async function parseMetaCommand(filtered: string[], jsonMode = false): Pr
         }
       }
 
-      // Extension-reachability probe (#49) — verbose-only, daemon-alive-only.
-      // Stays a true local-pre-spawn check otherwise.
-      if (verbose && snap.daemon) {
+      // Extension-reachability probe (#49).
+      // Always runs when the daemon is already alive (no auto-spawn risk) so
+      // that "interceptor status" surfaces "no managed tabs" without --verbose.
+      // Skipped only when the daemon isn't running, preserving the local-only
+      // pre-spawn guarantee for that case.
+      if (snap.daemon) {
         const probe = await probeExtensionReachability()
         snap.extension = { probed: true, ...probe }
-      } else if (verbose && !snap.daemon) {
+      } else {
         snap.extension = { probed: false, reachable: false, reason: "daemon not running" }
       }
 

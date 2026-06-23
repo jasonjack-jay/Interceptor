@@ -36,7 +36,7 @@ INTERCEPTOR_SIGNING_IDENTITY="${INTERCEPTOR_SIGNING_IDENTITY:-Developer ID Appli
 if [[ -z "$INTERCEPTOR_SIGNING_IDENTITY_EXPLICIT" ]] \
    && ! security find-identity -p codesigning -v 2>/dev/null | grep -q "$INTERCEPTOR_SIGNING_IDENTITY"; then
   AUTO_SIGN_IDENTITY="$(security find-identity -p codesigning -v 2>/dev/null \
-    | grep -oE '"(Apple Development|Developer ID Application)[^"]*"' | head -1 | tr -d '"')"
+    | grep -oE '"(Apple Development|Developer ID Application)[^"]*"' | head -1 | tr -d '"' || true)"
   if [[ -n "$AUTO_SIGN_IDENTITY" ]]; then
     echo "==> Configured identity absent; auto-selecting local identity for stable TCC: $AUTO_SIGN_IDENTITY"
     INTERCEPTOR_SIGNING_IDENTITY="$AUTO_SIGN_IDENTITY"

@@ -60,8 +60,11 @@ async function ensureInterceptorGroup() {
   const groups = await chrome.tabGroups.query({});
   const match = groups.find((g) => typeof g.title === "string" && candidates.includes(g.title));
   if (match) {
-    interceptorGroupId = match.id;
-    return interceptorGroupId;
+    const tabs = await chrome.tabs.query({ groupId: match.id });
+    if (tabs.length > 0) {
+      interceptorGroupId = match.id;
+      return interceptorGroupId;
+    }
   }
   return -1;
 }
@@ -647,13 +650,17 @@ async function handleDomRenderScreenshot(action, tabId) {
       dsAction.target_max_long_edge = targetMaxLongEdge;
     let renderResult;
     try {
-      renderResult = await withCaptureTimeout("dom-render", sendToContentScript(tabId, dsAction), DOM_RENDER_TIMEOUT_MS);
+      renderResult = await withCaptureVisibleTabFocus(tabId, targetTab.windowId, () => withCaptureTimeout("dom-render", sendToContentScript(tabId, dsAction), DOM_RENDER_TIMEOUT_MS));
     } catch (err) {
       if (err instanceof CaptureTimeoutError) {
         return {
           success: false,
-          error: `DOM-render timed out after ${DOM_RENDER_TIMEOUT_MS}ms — the content script did not return image data. The render stalled (e.g. a resource never settled); retry, or use --pixel for a compositor capture.`,
-          data: { layer: "dom-render-timeout" }
+          error: `DOM-render screenshot timed out after ${err.timeoutMs}ms — the page never finished rasterizing.`,
+          data: {
+            hint: 'Try a smaller scope (--selector "<css>" or --region X,Y,W,H), or use --pixel for a fast compositor capture. Very large or resource-heavy pages can exceed the render budget.',
+            layer: "dom-render",
+            timedOutAt: err.operation
+          }
         };
       }
       throw err;

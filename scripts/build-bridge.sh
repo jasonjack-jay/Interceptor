@@ -11,6 +11,8 @@
 #                                 / Developer ID identity so TCC grants persist
 #                                 across rebuilds instead of ad-hoc churn)
 #   INTERCEPTOR_BRIDGE_VERSION    version string in Info.plist (default 1.0.0)
+#   INTERCEPTOR_ENABLE_PLATFORM_TARGETS=1
+#                                  compile in research-only platform target support
 #   INTERCEPTOR_SKIP_SIGNING=1    skip codesign + lsregister (dev mode)
 
 set -euo pipefail
@@ -54,7 +56,15 @@ APP_ICON_NAME="interceptor"
 
 echo "==> Building interceptor-bridge (release)..."
 cd "$BRIDGE_DIR"
-swift build -c release 2>&1
+SWIFT_FLAGS=()
+if [[ "${INTERCEPTOR_ENABLE_PLATFORM_TARGETS:-0}" == "1" ]]; then
+  echo "==> Native platform target support: ENABLED (research build)"
+  SWIFT_FLAGS+=("-Xswiftc" "-DINTERCEPTOR_ENABLE_PLATFORM_TARGETS")
+  swift build -c release "${SWIFT_FLAGS[@]}" 2>&1
+else
+  echo "==> Native platform target support: disabled (public build)"
+  swift build -c release 2>&1
+fi
 
 BINARY="$BRIDGE_DIR/.build/release/interceptor-bridge"
 if [ ! -f "$BINARY" ]; then
@@ -174,6 +184,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>interceptor-bridge captures screen frames when you ask Interceptor to take screenshots or run screen capture / stream commands.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>interceptor-bridge captures microphone input when you ask Interceptor to use listen / audio commands.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>interceptor-bridge transcribes speech during workflow capture so Interceptor can build a semantic transcript of what you demonstrate (mac_monitor --include speech, mac_listen).</string>
 
     <!-- personal data and distribution surfaces.
          Each TCC-gated framework gets a usage description string that surfaces

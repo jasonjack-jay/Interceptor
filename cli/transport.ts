@@ -18,12 +18,22 @@ export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT |
 const ACTION_TIMEOUT_OVERRIDES_MS: Record<string, number> = {
   macos_listen: 60_000,
   macos_vad: 60_000,
+  // monitor start/stop can do non-trivial setup/teardown (AX
+  // attach across many apps under --all-apps, frame/video/speech engines,
+  // source snapshot). Even though the bridge now acks early, give the
+  // RPC an elevated deadline as a safety margin so a momentarily busy main
+  // run loop never trips the old 15s timeout that left a split-brain envelope.
+  macos_monitor: 60_000,
   screenshot: 45_000,
+  binary_sink_save: 600_000,
   screenshot_background: 45_000,
   canvas_read: 45_000,
-  canvas_ocr: 45_000,
+  canvas_ocr: 60_000,
   canvas_diff: 45_000,
   capture_frame: 45_000,
+  // OCR: native capture + Tesseract. First call also lazy-loads the WASM core +
+  // language data, so allow generous headroom.
+  ocr: 60_000,
 }
 
 function pickTimeoutForAction(actionType: string): number {

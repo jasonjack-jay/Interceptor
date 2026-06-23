@@ -131,19 +131,6 @@ function resolveDomMode(action: { [key: string]: unknown }): DomScreenshotMode {
   return "full"
 }
 
-async function injectScreenshotRunner(tabId: number): Promise<{ success: boolean; error?: string }> {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED" as chrome.scripting.ExecutionWorld,
-      files: ["screenshot-runner.js"]
-    })
-    return { success: true }
-  } catch (err) {
-    return { success: false, error: `failed to inject screenshot-runner.js: ${(err as Error).message}` }
-  }
-}
-
 // Re-encode a PNG/JPEG dataUrl as WebP using OffscreenCanvas.
 // html-to-image only emits PNG/JPEG, and chrome.tabs.captureVisibleTab only
 // accepts PNG/JPEG. WebP support is added by re-encoding at the SW boundary.
@@ -208,11 +195,11 @@ async function handleDomRenderScreenshot(
     }
   }
 
+  // The DNR CORS rule lets the content script fetch third-party <img> /
+  // background-image resources CORS-clean so they can be embedded as data URLs.
+  // No library injection is needed — content.ts renders natively.
   await installScreenshotCorsRule(tabId)
   try {
-    const inject = await injectScreenshotRunner(tabId)
-    if (!inject.success) return { success: false, error: inject.error || "runner injection failed" }
-
     const dsAction: { type: string; [key: string]: unknown } = { type: "dom_screenshot", mode, format: renderFormat, quality }
     if (action.ref !== undefined) dsAction.ref = action.ref
     if (action.element !== undefined) dsAction.index = action.element
@@ -598,6 +585,40 @@ async function transformPixelDataUrl(
   }
 }
 
+// ─── OCR: native capture → bundled Tesseract → deterministic text ─────────────
+// Renders the target (selector / element / region / full page) to a PNG via the
+// native DOM-render path, then OCRs it in the offscreen document with the
+// bundled Tesseract.js engine. Cross-platform, offline, no macOS bridge, and no
+// round-trip of pixels to the agent — returns a plain text string.
+async function handleOcr(
+  action: { type: string; [key: string]: unknown },
+  tabId: number
+): Promise<ActionResult> {
+  const shot: { type: string; [key: string]: unknown } = { type: "screenshot", format: "png", save: false }
+  for (const k of ["selector", "element", "ref", "region", "clip", "scale", "target_max_long_edge"]) {
+    if (action[k] !== undefined) shot[k] = action[k]
+  }
+  const rendered = await handleDomRenderScreenshot(shot, tabId)
+  if (!rendered.success) return rendered
+  const dataUrl = (rendered.data as { dataUrl?: string } | undefined)?.dataUrl
+  if (!dataUrl) return { success: false, error: "capture for OCR produced no image" }
+
+  const ocr = await sendToOffscreen({ type: "ocr", dataUrl }) as {
+    success: boolean; data?: { text?: string; source?: string; confidence?: number | null }; error?: string
+  }
+  if (!ocr.success) return { success: false, error: ocr.error || "OCR failed" }
+  return {
+    success: true,
+    data: {
+      text: (ocr.data?.text || "").trim(),
+      source: ocr.data?.source || "tesseract",
+      confidence: ocr.data?.confidence ?? null,
+      width: (rendered.data as { width?: number } | undefined)?.width,
+      height: (rendered.data as { height?: number } | undefined)?.height
+    }
+  }
+}
+
 // ─── Public dispatcher ────────────────────────────────────────────────────────
 
 export async function handleScreenshotActions(
@@ -607,6 +628,9 @@ export async function handleScreenshotActions(
   switch (action.type) {
     case "screenshot_background":
       return handleScreenshotBackground(action, tabId)
+
+    case "ocr":
+      return handleOcr(action, tabId)
 
     case "page_capture": {
       const mhtml = await chrome.pageCapture.saveAsMHTML({ tabId })

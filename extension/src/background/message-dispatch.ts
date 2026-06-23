@@ -10,6 +10,7 @@ export const messageQueue: Array<{
 }> = []
 
 const EXT_REQUEST_TIMEOUT_MS = 180_000
+const EXT_LONG_REQUEST_TIMEOUT_MS = 600_000
 export const pendingRequests = new Map<string, {
   action: string
   tabId?: number
@@ -17,6 +18,19 @@ export const pendingRequests = new Map<string, {
   timer: ReturnType<typeof setTimeout>
   viaWs?: boolean
 }>()
+
+async function getActiveTabId(): Promise<number | undefined> {
+  const storage = chrome.storage as typeof chrome.storage & { session?: chrome.storage.StorageArea }
+  const area = storage.session ?? chrome.storage.local
+  const stored = await area.get("activeTabId") as { activeTabId?: number }
+  return stored.activeTabId
+}
+
+async function setActiveTabId(tabId: number): Promise<void> {
+  const storage = chrome.storage as typeof chrome.storage & { session?: chrome.storage.StorageArea }
+  const area = storage.session ?? chrome.storage.local
+  await area.set({ activeTabId: tabId })
+}
 
 export function drainMessageQueue(): void {
   while (messageQueue.length > 0) {
@@ -32,7 +46,7 @@ export function needsTab(type: string): boolean {
     "bookmark_create", "downloads_search", "browsing_data_remove",
     "session_list", "session_restore", "notification_create", "notification_clear",
     "search_query", "monitor_status", "monitor_start", "monitor_pause", "monitor_resume",
-    "monitor_stop"
+    "monitor_stop", "brand_set_tab_group"
   ])
   return !noTabActions.has(type)
 }
@@ -67,11 +81,14 @@ export async function handleDaemonMessage(msg: {
     return
   }
 
+  const requestTimeoutMs = msg.action.type === "binary_sink_save"
+    ? EXT_LONG_REQUEST_TIMEOUT_MS
+    : EXT_REQUEST_TIMEOUT_MS
   const requestTimer = setTimeout(() => {
     const req = pendingRequests.get(msg.id!)
     pendingRequests.delete(msg.id!)
     sendToHost({ id: msg.id, result: { success: false, error: "extension timeout" } }, req?.viaWs)
-  }, EXT_REQUEST_TIMEOUT_MS)
+  }, requestTimeoutMs)
 
   const startTime = Date.now()
   const shortId = msg.id.slice(0, 8)
@@ -89,14 +106,13 @@ export async function handleDaemonMessage(msg: {
   let tabId = msg.tabId
 
   if (!tabId && needsTab(action.type)) {
-    const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
-    tabId = stored.activeTabId
+    tabId = await getActiveTabId()
   }
 
   if (!tabId && needsTab(action.type)) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
     tabId = activeTab?.id
-    if (tabId) chrome.storage.session.set({ activeTabId: tabId })
+    if (tabId) setActiveTabId(tabId)
   }
 
   if (!tabId && needsTab(action.type)) {
@@ -106,7 +122,7 @@ export async function handleDaemonMessage(msg: {
     return
   }
 
-  if (tabId) chrome.storage.session.set({ activeTabId: tabId })
+  if (tabId) setActiveTabId(tabId)
 
   if (tabId && needsTab(action.type) && !action.anyTab) {
     const inGroup = await isTabInInterceptorGroup(tabId)

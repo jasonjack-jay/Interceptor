@@ -13,24 +13,48 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 //
 // These tests stub chrome.tabs.get + chrome.windows.get and assert that:
 //   (1) a minimized window short-circuits with the preflight error + data shape
-//       and never touches the content-script / CORS / inject machinery, and
+//       and never touches the content-script / CORS machinery, and
 //   (2) a non-minimized window passes the preflight (proven here by the call
-//       advancing past windows.get to the inject stage).
+//       advancing past windows.get to the content-script dispatch stage).
+//
+// The DOM render is now native (content.ts), so the path no longer injects a
+// screenshot-runner bundle — after the preflight it installs the DNR CORS rule
+// and dispatches the dom_screenshot action to the content script via
+// chrome.tabs.sendMessage.
 
 interface FakeTab { id: number; windowId: number }
-interface FakeWindow { id: number; state: chrome.windows.windowStateEnum }
+interface FakeWindow { id: number; state: string }
 
 let windowGetCalls: number[]
-let scriptingInjectCalls: number
+let sendMessageCalls: number
+let tabUpdateCalls: Array<{ tabId: number; props: chrome.tabs.UpdateProperties }>
 let originalChrome: unknown
 
 function installFakeChrome(tab: FakeTab, win: FakeWindow) {
   windowGetCalls = []
-  scriptingInjectCalls = 0
+  sendMessageCalls = 0
+  tabUpdateCalls = []
   originalChrome = (globalThis as { chrome?: unknown }).chrome
   ;(globalThis as { chrome: unknown }).chrome = {
     tabs: {
       get: async (tabId: number) => (tabId === tab.id ? tab : null),
+      query: async (q: chrome.tabs.QueryInfo) => {
+        if (q.active && q.windowId === tab.windowId) return [{ id: 100, windowId: tab.windowId, active: true }]
+        return []
+      },
+      update: async (tabId: number, props: chrome.tabs.UpdateProperties) => {
+        tabUpdateCalls.push({ tabId, props })
+        return { id: tabId, windowId: tab.windowId, active: !!props.active }
+      },
+      // If the preflight fails to short-circuit, the path installs the DNR CORS
+      // rule then dispatches dom_screenshot to the content script. Stub
+      // sendMessage so the dispatch is observable (sendMessageCalls > 0) and
+      // return a benign failure so handleDomRenderScreenshot returns early
+      // without needing OffscreenCanvas/fetch.
+      sendMessage: (_tabId: number, _msg: unknown, _opts: unknown, cb?: (r: unknown) => void) => {
+        sendMessageCalls++
+        if (typeof cb === "function") cb({ success: false, error: "test-stub" })
+      },
     },
     windows: {
       get: async (windowId: number) => {
@@ -38,15 +62,9 @@ function installFakeChrome(tab: FakeTab, win: FakeWindow) {
         return win.id === windowId ? win : null
       },
     },
-    // If the preflight fails to short-circuit, the next thing the path does is
-    // install a DNR CORS rule then inject the runner. Stub both so a leak is
-    // observable (scriptingInjectCalls > 0) rather than throwing.
     declarativeNetRequest: {
       updateSessionRules: async () => undefined,
       getSessionRules: async () => [],
-    },
-    scripting: {
-      executeScript: async () => { scriptingInjectCalls++; return [] },
     },
   }
 }
@@ -71,20 +89,25 @@ describe("DOM-render screenshot — minimized-window preflight", () => {
     const data = result.data as { layer?: string; windowState?: string }
     expect(data.layer).toBe("preflight")
     expect(data.windowState).toBe("minimized")
-    // Proves the fast-fail: the window state was checked and the runner was
-    // never injected (no 15s hang path).
+    // Proves the fast-fail: the window state was checked and the content script
+    // was never dispatched to (no 15s hang path).
     expect(windowGetCalls).toEqual([1])
-    expect(scriptingInjectCalls).toBe(0)
+    expect(sendMessageCalls).toBe(0)
   })
 
-  test("non-minimized window passes the preflight and proceeds toward injection", async () => {
+  test("non-minimized window passes the preflight and proceeds toward the content-script dispatch", async () => {
     installFakeChrome({ id: 200, windowId: 1 }, { id: 1, state: "normal" })
     const { handleScreenshotActions } = await import("../extension/src/background/capabilities/screenshot")
-    // We don't drive a full render here (no content script / OffscreenCanvas in
-    // bun's env); we only assert the preflight did NOT short-circuit, i.e. the
-    // path advanced past windows.get to the inject stage.
+    // We don't drive a full native render here (no real content script in bun's
+    // env); we only assert the preflight did NOT short-circuit, i.e. the path
+    // advanced past windows.get to dispatching dom_screenshot to the content
+    // script.
     await handleScreenshotActions({ type: "screenshot", save: true }, 200).catch(() => undefined)
     expect(windowGetCalls).toEqual([1])
-    expect(scriptingInjectCalls).toBeGreaterThan(0)
+    expect(tabUpdateCalls).toEqual([
+      { tabId: 200, props: { active: true } },
+      { tabId: 100, props: { active: true } },
+    ])
+    expect(sendMessageCalls).toBeGreaterThan(0)
   })
 })

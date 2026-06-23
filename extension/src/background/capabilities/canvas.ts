@@ -172,6 +172,55 @@ function hostCanvasSignals(limit = 20) {
   }
 }
 
+// Native accessibility text for a <canvas>, read in the MAIN world. A canvas's
+// accessible text comes from aria-label / aria-labelledby / aria-describedby /
+// title and, per the HTML spec, its child DOM (the "fallback content" the
+// accessibility tree exposes) plus an enclosing <figure>'s <figcaption>. This
+// is the browser-native text source — no pixel OCR, no library.
+function canvasAccessibleText(canvasIndex: number) {
+  const canvases = Array.from(document.querySelectorAll("canvas"))
+  const c = canvases[canvasIndex]
+  if (!c) return { found: false, error: "canvas index out of range", canvasCount: canvases.length }
+
+  const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim()
+  const byIds = (ids: string | null) =>
+    !ids ? "" : ids.split(/\s+/).map((id) => norm(document.getElementById(id)?.textContent)).filter(Boolean).join(" ")
+
+  const sources: Record<string, string> = {}
+  const ariaLabel = norm(c.getAttribute("aria-label"))
+  if (ariaLabel) sources.ariaLabel = ariaLabel
+  const ariaLabelledby = byIds(c.getAttribute("aria-labelledby"))
+  if (ariaLabelledby) sources.ariaLabelledby = ariaLabelledby
+  // Child DOM of <canvas> is its accessibility fallback subtree.
+  const fallback = norm(c.textContent)
+  if (fallback) sources.fallback = fallback
+  const fig = c.closest("figure")
+  const figcaption = fig ? norm(fig.querySelector("figcaption")?.textContent) : ""
+  if (figcaption) sources.figcaption = figcaption
+  const ariaDescribedby = byIds(c.getAttribute("aria-describedby"))
+  if (ariaDescribedby) sources.ariaDescribedby = ariaDescribedby
+  const title = norm(c.getAttribute("title"))
+  if (title) sources.title = title
+
+  // Priority: explicit name → fallback content → caption → description → title.
+  const text = [
+    sources.ariaLabel,
+    sources.ariaLabelledby,
+    sources.fallback,
+    sources.figcaption,
+    sources.ariaDescribedby,
+    sources.title
+  ].filter(Boolean).join("\n")
+
+  return {
+    found: !!text,
+    text,
+    role: c.getAttribute("role") || "",
+    sources,
+    canvasCount: canvases.length
+  }
+}
+
 function canvasObserverSummary(limit = 100, kinds?: string[], canvasIndex?: number) {
   function normalize(kind: unknown): string {
     return String(kind || "").trim()
@@ -454,42 +503,57 @@ export async function handleCanvasActions(
     }
 
     case "canvas_ocr": {
-      const readResult = await handleCanvasActions({
-        type: "canvas_read",
-        canvasIndex: action.canvasIndex,
-        region: action.region,
-        format: "png"
-      }, tabId)
-      if (!readResult.success) return readResult
-      const dataUrl = (readResult.data as { dataUrl?: string }).dataUrl
-      if (!dataUrl) return { success: false, error: "canvas OCR requires a readable canvas image" }
-
-      const ocrResult = await sendToOffscreen({
-        type: "ocr",
-        dataUrl
-      }) as { success: boolean; data?: { text?: string; source?: string; confidence?: number | null }; error?: string }
-
-      if (!ocrResult.success) return { success: false, error: ocrResult.error || "canvas OCR failed" }
-
+      // Native text only — no pixel OCR. Read the canvas's accessibility text
+      // (aria-* + fallback subtree) plus the page's own semantic textbox model.
+      // For a canvas-rendered editor prefer `scene text`; for genuine pixel-only
+      // text use `macos vision text` (native macOS Vision OCR).
+      const a11y = await executeInMainWorld<ReturnType<typeof canvasAccessibleText>>(
+        tabId, canvasAccessibleText, [action.canvasIndex]
+      )
+      if (a11y && (a11y as { error?: string }).error) {
+        return { success: false, error: (a11y as { error?: string }).error }
+      }
       const hostSignals = await executeInMainWorld<ReturnType<typeof hostCanvasSignals>>(tabId, hostCanvasSignals, [10])
-      const semanticText = hostSignals?.docs?.textbox?.exists ? hostSignals.docs.textbox.textSample || "" : ""
-      const ocrText = ocrResult.data?.text || ""
-      const normalizedOcr = ocrText.replace(/\s+/g, " ").trim()
-      const normalizedSemantic = semanticText.replace(/\s+/g, " ").trim()
-      const matchedSemantic = normalizedOcr && normalizedSemantic
-        ? normalizedSemantic.includes(normalizedOcr) || normalizedOcr.includes(normalizedSemantic)
-        : false
+      const semanticText = hostSignals?.docs?.textbox?.exists ? (hostSignals.docs.textbox.textSample || "") : ""
+      const a11yText = a11y && (a11y as { found?: boolean }).found ? ((a11y as { text?: string }).text || "") : ""
+
+      let text = a11yText || semanticText
+      let source = a11yText ? "accessibility" : (semanticText ? "semantic-textbox" : "none")
+      let confidence: number | null = null
+      let ocrFallbackUsed = false
+
+      // No native text → OCR the canvas pixels with the bundled Tesseract engine
+      // (offline, cross-platform — works on browser-only / non-macOS installs).
+      if (!text) {
+        const readResult = await handleCanvasActions({
+          type: "canvas_read", canvasIndex: action.canvasIndex, region: action.region, format: "png"
+        }, tabId)
+        const dataUrl = readResult.success ? (readResult.data as { dataUrl?: string }).dataUrl : undefined
+        if (dataUrl) {
+          const ocr = await sendToOffscreen({ type: "ocr", dataUrl }) as { success: boolean; data?: { text?: string; confidence?: number | null }; error?: string }
+          if (ocr.success && (ocr.data?.text || "").trim()) {
+            text = (ocr.data!.text as string).trim()
+            source = "tesseract"
+            confidence = ocr.data?.confidence ?? null
+            ocrFallbackUsed = true
+          }
+        }
+      }
 
       return {
         success: true,
         data: {
-          text: ocrText,
-          source: ocrResult.data?.source || "ocr",
-          confidence: ocrResult.data?.confidence ?? null,
+          text,
+          source,
+          confidence,
           diagnostics: {
-            pixelSource: "canvas_read",
-            strongerSourceAvailable: !!semanticText,
-            strongerSourceMatched: matchedSemantic
+            accessibilityText: !!a11yText,
+            accessibilitySources: (a11y as { sources?: unknown })?.sources || null,
+            semanticTextboxAvailable: !!semanticText,
+            ocrFallbackUsed,
+            hint: text
+              ? undefined
+              : "No accessible/semantic text and pixel OCR found nothing. For a canvas-rendered editor use `interceptor scene text`."
           }
         }
       }

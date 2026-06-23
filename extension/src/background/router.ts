@@ -17,6 +17,7 @@ import { handleSearchActions } from "./capabilities/search"
 import { handleBrowsingDataActions } from "./capabilities/browsing-data"
 import { handleHeaderActions } from "./capabilities/headers"
 import { handleEvaluateActions } from "./capabilities/evaluate"
+import { handleBinarySinkActions } from "./capabilities/binary-sink"
 import { handleStyleActions } from "./capabilities/style"
 import { handleFrameActions } from "./capabilities/frames"
 import { handleMetaActions } from "./capabilities/meta"
@@ -30,7 +31,7 @@ restorePageCommCaptureConfig()
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
 const OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move"])
-const SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture"])
+const SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture", "ocr"])
 const CAPTURE_STREAM_ACTIONS = new Set(["capture_start", "capture_frame", "capture_stop", "canvas_diff"])
 const CANVAS_ACTIONS = new Set([
   "canvas_list",
@@ -66,9 +67,10 @@ const NOTIFICATION_ACTIONS = new Set(["notification_create", "notification_clear
 const BROWSING_DATA_ACTIONS = new Set(["browsing_data_remove"])
 const HEADER_ACTIONS = new Set(["headers_modify"])
 const EVALUATE_ACTIONS = new Set(["evaluate"])
+const BINARY_SINK_ACTIONS = new Set(["binary_sink_save"])
 const STYLE_ACTIONS = new Set(["style_inject", "style_remove"])
 const FRAME_ACTIONS = new Set(["frames_list", "frames_read_tree"])
-const META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree"])
+const META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group"])
 const PASSIVE_NET_ACTIONS = new Set([
   "net_log", "net_clear", "net_headers", "sse_log", "sse_streams", "sse_chunk",
   "set_net_overrides", "clear_net_overrides",
@@ -104,6 +106,7 @@ export async function routeAction(
   if (BROWSING_DATA_ACTIONS.has(action.type)) return handleBrowsingDataActions(action, tabId)
   if (HEADER_ACTIONS.has(action.type)) return handleHeaderActions(action, tabId)
   if (EVALUATE_ACTIONS.has(action.type)) return handleEvaluateActions(action, tabId)
+  if (BINARY_SINK_ACTIONS.has(action.type)) return handleBinarySinkActions(action, tabId)
   if (STYLE_ACTIONS.has(action.type)) return handleStyleActions(action, tabId)
   if (FRAME_ACTIONS.has(action.type)) return handleFrameActions(action, tabId)
   if (META_ACTIONS.has(action.type)) return handleMetaActions(action, tabId)

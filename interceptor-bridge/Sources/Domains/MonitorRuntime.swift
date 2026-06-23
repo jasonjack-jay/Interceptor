@@ -69,13 +69,45 @@ final class MonitorRuntime: @unchecked Sendable {
     #if canImport(ScreenCaptureKit)
     var captureStream: SCStream?
     var captureOutput: MonitorCaptureOutput?
+    // continuous video via SCRecordingOutput (macOS 15+).
+    var recordingOutput: SCRecordingOutput?
+    var recordingPath: String?
+    var recordingDelegate: AnyObject?
     #endif
+
+    // guards the speech ring buffer (mutated on the audio render
+    // thread, read on the restart timer queue).
+    let speechLock = NSLock()
 
     #if canImport(Speech)
     var speechEngine: AVAudioEngine?
     var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     var speechTask: SFSpeechRecognitionTask?
+    // restart the SFSpeechRecognitionTask before Apple's ~60s
+    // hard limit. The ring buffer replays the trailing ~2s of audio across the
+    // restart so a word spanning the boundary isn't dropped.
+    var speechRestartTimer: DispatchSourceTimer?
+    var speechRing: [AVAudioPCMBuffer] = []
+    var speechRingFrameBudget: AVAudioFrameCount = 0
+    var speechRestarting = false
+    // offline fallback: always tee mic audio to a .caf under the
+    // session dir using the (already-granted) Microphone permission, so a
+    // transcript exists even when live Speech-Recognition TCC is denied.
+    var speechAudioFile: AVAudioFile?
+    var speechCafPath: String?
     #endif
+
+    // per-session capture configuration (parsed from monitor start).
+    var speechMode: String = "auto"          // auto | live | offline | off
+    var framePixelScale: Int = 2
+    var frameBudget: Int = 7200              // 0 = unbounded
+    var frameDiskCapBytes: Int64 = 0         // 0 = uncapped
+    var videoMaxBytes: Int64 = 0             // 0 = uncapped
+    var scrollCoalesceMs: Int = 100
+    var axCoalesceMs: Int = 100
+    var includeSystemApps: Bool = false
+    var excludeApps: Set<String> = []        // bundle ids or localized names
+    var backpressureNotified = false         // emit capture_backpressure once
 
     init(session: MonitorSession, domain: MonitorDomain) {
         self.session = session

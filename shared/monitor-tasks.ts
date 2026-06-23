@@ -11,7 +11,7 @@ import {
 } from "node:fs"
 import { createHash, randomUUID } from "node:crypto"
 import { join } from "node:path"
-import { TEMP } from "./platform"
+import { TEMP, MONITOR_SESSIONS_DIR } from "./platform"
 import {
   getSessionDir,
   hasSessionArtifacts,
@@ -988,7 +988,7 @@ export function attachMonitorTaskSource(
       code: "source_metadata_binding_sidecar_required",
       sid,
       message: `Could not update source session metadata for ${sid}; task-owned binding metadata will be used.`,
-      recommendedFix: "Run monitor repair while source artifacts are still available.",
+      recommendedFix: "Run interceptor monitor repair --task <taskId> --snapshot-sources while source artifacts are still available.",
     })
   }
   return { task: updated, source }
@@ -1213,7 +1213,7 @@ export function snapshotMonitorTaskSources(taskId: string): MonitorTaskSourceMan
         code: "source_snapshot_incomplete",
         sid: source.sid,
         message: `Source snapshot for ${source.surface} session ${source.sid} is ${snapshotStatus}.`,
-        recommendedFix: "Run monitor repair --task <taskId> --snapshot-sources before temporary source artifacts are removed.",
+        recommendedFix: "Run interceptor monitor repair --task <taskId> --snapshot-sources before temporary source artifacts are removed.",
       })
     }
   }
@@ -1289,7 +1289,109 @@ export function stopMonitorTask(
     }
   }
   snapshotMonitorTaskSources(taskId)
+  transcribeTaskSpeechAudio(taskId)
   return readMonitorTaskMeta(taskId) || task
+}
+
+// recover the sid of a live monitor session bound to this task
+// by scanning session metas. Used when a slow/garbled start RPC response did not
+// carry the sid (so the CLI can still attach instead of leaving an empty
+// envelope). Returns the newest matching session.
+export function findLatestSessionSidForTask(taskId: string): string | undefined {
+  let best: { sid: string; startedAt: number } | undefined
+  let entries: string[]
+  try {
+    entries = readdirSync(MONITOR_SESSIONS_DIR)
+  } catch {
+    return undefined
+  }
+  for (const sid of entries) {
+    const meta = readSessionMeta(sid) as ({ taskId?: string; startedAt?: number } | null)
+    if (!meta || meta.taskId !== taskId) continue
+    const startedAt = typeof meta.startedAt === "number" ? meta.startedAt : 0
+    if (!best || startedAt > best.startedAt) best = { sid, startedAt }
+  }
+  return best?.sid
+}
+
+// offline transcription hook. The bridge writes speech.caf when
+// live Speech-Recognition was unavailable. This is the integration point that
+// turns that audio into transcript rows. The default build ships the interface
+// + detection; the concrete engine (Whisper, etc.) is selected at packaging
+// time (PRD open question). When a source has captured audio but no live
+// transcript and no engine is configured, we record an actionable diagnostic
+// rather than silently leaving the audio untranscribed.
+export function transcribeTaskSpeechAudio(taskId: string): { audioFound: number; alreadyTranscribed: number } {
+  const task = readMonitorTaskMeta(taskId)
+  if (!task) throw new Error(`task not found: ${taskId}`)
+  let audioFound = 0
+  let alreadyTranscribed = 0
+  for (const source of task.sourceSessions) {
+    const roots = [
+      source.sourceSnapshotRoot,
+      source.sourceArtifactRoot,
+      source.originalSourceArtifactRoot,
+      getSessionDir(source.sid),
+    ].filter((r): r is string => typeof r === "string" && r.length > 0)
+    const cafPath = roots.map((r) => join(r, "speech.caf")).find((p) => existsSync(p))
+    if (!cafPath) continue
+    audioFound++
+    const hasLiveSpeech = readTaskSourceEvents(source).some((e) => e.event === "speech_segment")
+    if (hasLiveSpeech) {
+      alreadyTranscribed++
+      continue
+    }
+    appendMonitorTaskDiagnostic(taskId, {
+      severity: "warning",
+      code: "speech_transcription_pending",
+      sid: source.sid,
+      message: `Captured offline audio (${cafPath}) has no live transcript; configure an offline speech engine to transcribe it.`,
+      recommendedFix: "Grant live ASR with 'interceptor macos trust speech --prompt' and re-capture, or wire an offline transcription engine.",
+    })
+  }
+  return { audioFound, alreadyTranscribed }
+}
+
+// the `monitor repair` operation the codebase has long advertised
+// in recommendedFix strings. Recovers any live-but-unattached sessions for the
+// task, durably snapshots all sources, runs the offline-transcription hook, then
+// regenerates the timeline/transcript/segments and re-grades.
+export function repairMonitorTask(
+  taskId: string,
+  options: { snapshotSources?: boolean; regenerate?: boolean } = {}
+): { manifest: MonitorTaskSourceManifestEntry[]; report: MonitorTaskCaptureQualityReport; attached: string[] } {
+  const task = readMonitorTaskMeta(taskId)
+  if (!task) throw new Error(`task not found: ${taskId}`)
+
+  // 1. Recover + attach live sessions that name this task but never registered.
+  const attached: string[] = []
+  const knownSids = new Set(task.sourceSessions.map((s) => s.sid))
+  let entries: string[] = []
+  try {
+    entries = readdirSync(MONITOR_SESSIONS_DIR)
+  } catch {
+    entries = []
+  }
+  for (const sid of entries) {
+    if (knownSids.has(sid)) continue
+    const meta = readSessionMeta(sid) as ({ taskId?: string; surface?: MonitorTaskSurface } | null)
+    if (!meta || meta.taskId !== taskId) continue
+    try {
+      attachMonitorTaskSource(taskId, sid, { surface: meta.surface })
+      attached.push(sid)
+    } catch {
+      /* already attached to another active task, or no artifacts — skip */
+    }
+  }
+
+  // 2. Snapshot (default), transcribe offline audio, regenerate, re-grade.
+  const manifest = snapshotMonitorTaskSources(taskId)
+  transcribeTaskSpeechAudio(taskId)
+  if (options.regenerate !== false) {
+    synthesizeMonitorTaskTranscript(taskId)
+  }
+  const report = generateMonitorTaskCaptureQuality(taskId)
+  return { manifest, report, attached }
 }
 
 function stableId(prefix: string, parts: unknown[]): string {
@@ -1972,7 +2074,7 @@ export function generateMonitorTaskCaptureQuality(taskId: string): MonitorTaskCa
   const blueprintOk = durabilityOk && metadataOk && boundaryOk && evidenceOk && compressionOk && scopeOk && privacyOk
   const findings: MonitorTaskCaptureQualityReport["findings"] = []
 
-  if (!durabilityOk) findings.push({ severity: "blocker", code: "source_durability_incomplete", message: "One or more task sources are not durably snapshotted under the task root.", recommendedFix: "Run monitor repair --task <taskId> --snapshot-sources while source artifacts still exist." })
+  if (!durabilityOk) findings.push({ severity: "blocker", code: "source_durability_incomplete", message: "One or more task sources are not durably snapshotted under the task root.", recommendedFix: "Run interceptor monitor repair --task <taskId> --snapshot-sources while source artifacts still exist." })
   if (!metadataOk) findings.push({ severity: "error", code: "source_metadata_incomplete", message: "One or more task-attached sources lacks complete taskId or surface metadata." })
   if (tmpBackedSourceRefs > 0) findings.push({ severity: "warning", code: "tmp_backed_source_refs", message: `${tmpBackedSourceRefs} source references still point to /tmp.`, recommendedFix: "Regenerate the timeline/transcript after source snapshots complete." })
   if (outOfBoundsEvents > 0) findings.push({ severity: "warning", code: "out_of_bounds_events", message: `${outOfBoundsEvents} timeline events are outside the task boundary window.` })
@@ -1982,6 +2084,42 @@ export function generateMonitorTaskCaptureQuality(taskId: string): MonitorTaskCa
   if (!ratioOk) findings.push({ severity: "warning", code: "weak_transcript_compression", message: `Teachable transcript compression is too weak (${segments.length} segments from ${transcript.length} transcript rows).`, recommendedFix: "Regenerate with the reducer-backed segmenter or add an app-specific semantic adapter." })
   if (!humanScaleOk) findings.push({ severity: "warning", code: "transcript_not_human_scale", message: `Teachable transcript has ${segments.length} segments; expected at most ${humanScaleLimit} for this capture size.`, recommendedFix: "Suppress low-value event kinds and group long text-edit sessions before blueprint compilation." })
   if (!semanticTitlesOk) findings.push({ severity: "warning", code: "semantic_segments_too_raw", message: `${rawTitleSegments} teachable segments still use raw event-style titles.`, recommendedFix: "Map raw monitor event groups into workflow-level titles before marking the task excellent." })
+
+  // capture-specific findings sourced from raw source events so the
+  // operator sees *why* a transcript is thin (permission vs scope vs geometry).
+  let speechDenied = false
+  let speechSegmentRows = 0
+  let degenerateFrames = 0
+  for (const source of task.sourceSessions) {
+    for (const e of readTaskSourceEvents(source)) {
+      if (e.event === "speech_segment") speechSegmentRows++
+      else if (e.event === "speech_unavailable") {
+        const reason = typeof (e as { reason?: unknown }).reason === "string" ? (e as { reason: string }).reason : ""
+        if (/authorization\s+(1|2)|denied|restricted|missing NSSpeechRecognitionUsageDescription/i.test(reason)) speechDenied = true
+      } else if (e.event === "frame") {
+        const w = Number((e as { w?: unknown }).w) || 0
+        const h = Number((e as { h?: unknown }).h) || 0
+        if (w > 0 && h > 0 && Math.max(w, h) / Math.max(1, Math.min(w, h)) > 50) degenerateFrames++
+      }
+    }
+  }
+  if (speechDenied && speechSegmentRows === 0) {
+    findings.push({
+      severity: "warning",
+      code: "speech_permission_denied",
+      message: "Speech Recognition was unavailable (TCC denied or usage key missing); no live transcript was produced.",
+      recommendedFix: "Run interceptor macos trust speech --prompt, then re-run capture (or use --speech-mode offline to capture audio for offline transcription).",
+    })
+  }
+  if (degenerateFrames > 0) {
+    findings.push({
+      severity: "warning",
+      code: "frame_geometry_degenerate",
+      message: `${degenerateFrames} captured frames have implausible geometry (extreme aspect ratio — the SCStream sliver bug).`,
+      recommendedFix: "Re-capture; the pixel-scale + scalesToFit geometry fix resolves sliver frames.",
+    })
+  }
+
   for (const diagnostic of diagnostics.filter((item) => item.severity === "error" || item.severity === "blocker")) {
     findings.push({ severity: diagnostic.severity, code: diagnostic.code, message: diagnostic.message, evidenceRefs: diagnostic.evidenceRefs, recommendedFix: diagnostic.recommendedFix })
   }

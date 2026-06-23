@@ -12,7 +12,18 @@ import {
   markMonitorTaskSourceAttachFailed,
   resolveOrCreateMonitorTask,
   validateMonitorTaskMode,
+  findLatestSessionSidForTask,
+  readMonitorTaskMeta,
+  resolveMonitorTaskId,
+  stopMonitorTask,
+  synthesizeMonitorTaskTranscript,
+  generateMonitorTaskCaptureQuality,
+  renderMonitorTaskStatus,
+  renderMonitorTaskQualitySummary,
 } from "../../shared/monitor-tasks"
+import { runCdpCommand } from "./cdp"
+import { runNativeCommand } from "./native"
+import { extensionMacosPrefixes, extensionActionType } from "../../shared/extensions"
 
 type Action = { type: string; [key: string]: unknown }
 type Result = { success: boolean; error?: string; data?: unknown }
@@ -67,13 +78,22 @@ function bridgePreflightFailure(): string | null {
 
 export async function runMacosCommand(
   filtered: string[],
-  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number }
+  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; contextId?: string }
 ): Promise<void> {
   // Skip preflight only for "trust" — that subcommand is the user-driven
   // first-run permission walkthrough and may legitimately be the very first
   // call before anything else is wired up. The bridge will surface its own
   // not-ready errors there.
   const sub = filtered[1]
+  if (sub === "cdp") {
+    await runCdpCommand(filtered, { jsonMode: opts.jsonMode, contextId: opts.contextId })
+    return
+  }
+  if (sub === "runtime") {
+    await runNativeCommand(["runtime", ...filtered.slice(2)], { jsonMode: opts.jsonMode, contextId: opts.contextId })
+    return
+  }
+
   if (sub !== "trust") {
     const failure = bridgePreflightFailure()
     if (failure !== null) {
@@ -82,7 +102,11 @@ export async function runMacosCommand(
     }
   }
 
-  const action = parseMacosCommand(filtered)
+  // Extension Fabric: synchronously discover the set of
+  // manifest-declared `macos <prefix>` subcommands so an installed extension's
+  // verbs fall through to the generic builder instead of the hard `default`.
+  const extPrefixes = extensionMacosPrefixes()
+  const action = parseMacosCommand(filtered, extPrefixes)
   if (!action) process.exit(1)
 
   let pendingMonitorTaskId: string | undefined
@@ -117,7 +141,12 @@ export async function runMacosCommand(
 
   if (pendingMonitorTaskId) {
     const data = (result.data || {}) as Record<string, unknown>
-    const sid = typeof data.sid === "string" ? data.sid : typeof data.sessionId === "string" ? data.sessionId : undefined
+    // prefer the sid in the response, but if a slow/garbled RPC
+    // dropped it, recover the sid from the freshly-written session meta so the
+    // source still attaches (no more split-brain envelope with empty sources).
+    const sid = typeof data.sid === "string" ? data.sid
+      : typeof data.sessionId === "string" ? data.sessionId
+      : findLatestSessionSidForTask(pendingMonitorTaskId)
     if (sid) {
       try {
         attachMonitorTaskSource(pendingMonitorTaskId, sid, {
@@ -126,7 +155,16 @@ export async function runMacosCommand(
           rootBundleId: typeof data.rootBundleId === "string" ? data.rootBundleId : undefined,
           rootApp: typeof data.rootApp === "string" ? data.rootApp : undefined,
         })
+        // post-attach verification — confirm the source actually landed.
+        const verify = readMonitorTaskMeta(pendingMonitorTaskId)
+        const attached = verify?.sourceSessions.some((s) => s.sid === sid && s.status !== "detached")
+        if (!attached) {
+          markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, sid, "source attach did not register in task meta")
+          console.error(`error: macOS monitor session ${sid} did not register as a source of task ${pendingMonitorTaskId}`)
+          process.exit(1)
+        }
         data.taskId = pendingMonitorTaskId
+        data.sid = sid
         result.data = data
       } catch (err) {
         markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, sid, (err as Error).message)
@@ -135,6 +173,28 @@ export async function runMacosCommand(
       }
     } else {
       markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, undefined, "macos monitor response did not include sid")
+    }
+  }
+
+  // `interceptor macos monitor stop --task <t>` must finalize
+  // the envelope locally (the bridge only stops the session). Mirror the browser
+  // path: snapshot sources, transcribe offline audio, regenerate the
+  // timeline/transcript/segments, re-grade, and print status + quality.
+  if (action.type === "macos_monitor" && action.sub === "stop" && typeof action.taskRef === "string") {
+    try {
+      const taskId = resolveMonitorTaskId(action.taskRef)
+      stopMonitorTask(taskId, {}) // snapshots + transcribes offline audio
+      synthesizeMonitorTaskTranscript(taskId) // timeline + transcript + segments + grade
+      generateMonitorTaskCaptureQuality(taskId)
+      if (opts.jsonMode) {
+        console.log(JSON.stringify(readMonitorTaskMeta(taskId), null, 2))
+      } else {
+        console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+      }
+      return
+    } catch (err) {
+      console.error(`error: ${(err as Error).message}`)
+      process.exit(1)
     }
   }
 
@@ -149,7 +209,7 @@ export async function runMacosCommand(
   }
 }
 
-export function parseMacosCommand(filtered: string[]): Action | null {
+export function parseMacosCommand(filtered: string[], extensionPrefixes?: Set<string>): Action | null {
   const sub = filtered[1]
   if (!sub) {
     console.error("error: interceptor macos requires a subcommand. Examples:")
@@ -247,14 +307,19 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       // every prompt-triggering flag is forced false in the wire payload so
       // a future caller-side bug cannot accidentally modify TCC state.
       const noPrompt = filtered.includes("--no-prompt")
+      // `interceptor macos trust speech [--prompt]` is sugar for
+      // `interceptor macos trust --speech-prompt`; both surface the distinct
+      // Speech-Recognition TCC dialog.
+      const speechSub = filtered[2] === "speech"
       return {
         type: "macos_trust",
         noPrompt,
-        prompt: !noPrompt && (filtered.includes("--prompt") || filtered.includes("--walkthrough")),
+        prompt: !noPrompt && (filtered.includes("--prompt") || filtered.includes("--walkthrough")) && !speechSub,
         walkthrough: !noPrompt && filtered.includes("--walkthrough"),
         accessibilityPrompt: !noPrompt && filtered.includes("--accessibility-prompt"),
         screenPrompt: !noPrompt && filtered.includes("--screen-prompt"),
         microphonePrompt: !noPrompt && filtered.includes("--microphone-prompt"),
+        speechPrompt: !noPrompt && (filtered.includes("--speech-prompt") || (speechSub && (filtered.includes("--prompt") || filtered.length <= 3))),
       }
     }
 
@@ -732,6 +797,27 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       // Log-predicate override.
       const logPredicate = flagVal(filtered, "--log-predicate")
 
+      // new capture knobs.
+      const speechMode = flagVal(filtered, "--speech-mode")
+      // --video takes an optional fps (defaults to 4 when bare).
+      const videoIdx = filtered.indexOf("--video")
+      let video: number | undefined
+      if (videoIdx !== -1) {
+        const next = filtered[videoIdx + 1]
+        video = next && /^\d+$/.test(next) ? parseInt(next) : 4
+      }
+      const videoMaxMb = flagInt(filtered, "--video-max-mb")
+      const frameBudget = flagInt(filtered, "--frame-budget")
+      const frameDiskCapMb = flagInt(filtered, "--frame-disk-cap")
+      const framePixelScale = flagInt(filtered, "--frame-pixel-scale")
+      const scrollCoalesceMs = flagInt(filtered, "--scroll-coalesce-ms")
+      const axCoalesceMs = flagInt(filtered, "--ax-coalesce-ms")
+      const includeSystemApps = filtered.includes("--include-system-apps")
+      const excludeAppsRaw = collectMulti(filtered, "--exclude-app")
+      const excludeApps = excludeAppsRaw.length > 0
+        ? excludeAppsRaw.flatMap((s) => s.split(",")).map((s) => s.trim()).filter((s) => s.length > 0)
+        : undefined
+
       const action: Action = {
         type: "macos_monitor",
         sub: op,
@@ -773,6 +859,17 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       if (watchPath) action.watchPath = watchPath
       if (watchPaths) action.watchPaths = watchPaths
       if (logPredicate) action.logPredicate = logPredicate
+      // capture knobs (MB flags converted to bytes for the bridge).
+      if (speechMode) action.speechMode = speechMode
+      if (typeof video === "number") action.video = video
+      if (typeof videoMaxMb === "number") action.videoMaxBytes = videoMaxMb * 1024 * 1024
+      if (typeof frameBudget === "number") action.frameBudget = frameBudget
+      if (typeof frameDiskCapMb === "number") action.frameDiskCap = frameDiskCapMb * 1024 * 1024
+      if (typeof framePixelScale === "number") action.framePixelScale = framePixelScale
+      if (typeof scrollCoalesceMs === "number") action.scrollCoalesceMs = scrollCoalesceMs
+      if (typeof axCoalesceMs === "number") action.axCoalesceMs = axCoalesceMs
+      if (includeSystemApps) action.includeSystemApps = true
+      if (excludeApps) action.excludeApps = excludeApps
       return action
     }
 
@@ -1798,10 +1895,46 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       return action
     }
 
-    default:
+    default: {
+      // Extension Fabric: an installed extension may declare this
+      // prefix as a `macos <prefix> <cmd>` verb → route to its bridge domain as
+      // `macos_<prefix>_<cmd>` (mirrors vm's hyphen-normalized type encoding).
+      if (extensionPrefixes && sub && extensionPrefixes.has(sub)) {
+        return buildExtensionVerbAction(filtered, sub)
+      }
       console.error(`error: unknown macos subcommand '${sub}'. Run 'interceptor help' for usage.`)
       process.exit(1)
+    }
   }
+}
+
+/**
+ * Build a generic extension verb action: `macos <prefix> <cmd> [args] [--flags]`
+ * → `{ type: macos_<prefix>_<cmd>, sub: <cmd>, args, flags }`. The extension's
+ * bridge handler receives the verb (via the Router's `command`) plus this action;
+ * the core stays capability-blind (it knows the routing shape, not the behavior).
+ */
+function buildExtensionVerbAction(filtered: string[], prefix: string): Action | null {
+  const verb = filtered[2]
+  if (!verb || verb.startsWith("--")) {
+    console.error(`error: interceptor macos ${prefix} requires a subcommand (e.g. interceptor macos ${prefix} <cmd>)`)
+    process.exit(1)
+  }
+  const rest = filtered.slice(3)
+  const args: string[] = []
+  const flags: Record<string, string | boolean> = {}
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]
+    if (a.startsWith("--")) {
+      const key = a.slice(2)
+      const next = rest[i + 1]
+      if (next !== undefined && !next.startsWith("--")) { flags[key] = next; i++ }
+      else flags[key] = true
+    } else {
+      args.push(a)
+    }
+  }
+  return { type: extensionActionType(prefix, verb), sub: verb, args, flags }
 }
 
 function parseScriptRunAction(

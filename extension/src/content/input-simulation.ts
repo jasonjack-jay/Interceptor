@@ -26,8 +26,28 @@ export function dispatchClickSequence(el: Element, atX?: number, atY?: number) {
   const rect = el.getBoundingClientRect()
   const x = atX !== undefined ? rect.left + atX : rect.left + rect.width / 2
   const y = atY !== undefined ? rect.top + atY : rect.top + rect.height / 2
-  const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }
 
+  // Prefer dispatching the gesture in the page's MAIN world. Synthetic pointer
+  // events fired from this (ISOLATED) content-script world don't drive some
+  // frameworks' pointerdown handlers — e.g. Radix / Floating UI menus open on
+  // `pointerdown` but ignore isolated-world events, so `act` would click the
+  // trigger yet the menu never opens (verified: identical events, main world
+  // opens it, isolated world doesn't). inject-net.js (world: MAIN) listens for
+  // `__interceptor_click` and re-fires the full sequence there, acking back
+  // synchronously. Only when no ack returns (main-world bridge unavailable) do
+  // we fall back to the legacy isolated dispatch — so nothing that works today
+  // regresses.
+  let acked = false
+  const onAck = () => { acked = true }
+  el.addEventListener("__interceptor_click_ack", onAck, true)
+  try {
+    el.dispatchEvent(new CustomEvent("__interceptor_click", { bubbles: true, detail: { x, y } }))
+  } finally {
+    el.removeEventListener("__interceptor_click_ack", onAck, true)
+  }
+  if (acked) return
+
+  const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }
   el.dispatchEvent(new PointerEvent("pointerover", opts))
   el.dispatchEvent(new MouseEvent("mouseover", opts))
   el.dispatchEvent(new PointerEvent("pointerdown", opts))

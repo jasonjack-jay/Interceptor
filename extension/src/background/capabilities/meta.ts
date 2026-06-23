@@ -68,6 +68,16 @@ export async function handleMetaActions(
       }).join("\n")
       return { success: true, data: formatted || "empty tree" }
     }
+
+    case "brand_set_tab_group": {
+      // No-tab storage write that drives the runtime tab-group identity. The background
+      // brand-tab-group `onChanged` listener picks this up and live-retitles the group.
+      const title = typeof action.title === "string" ? action.title.trim() : ""
+      if (!title) return { success: false, error: "brand_set_tab_group requires a non-empty title" }
+      const color = typeof action.color === "string" ? action.color : "cyan"
+      await chrome.storage.local.set({ brandTabGroup: { title, color } })
+      return { success: true, data: { brandTabGroup: { title, color } } }
+    }
   }
   return { success: false, error: `unknown meta action: ${action.type}` }
 }

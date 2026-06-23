@@ -47,6 +47,10 @@ let logDomain = LogDomain()
 let intentDomain = IntentDomain()
 let containerDomain = ContainerDomain()
 
+// Runtime Agent surface: discover/enable/disable/status for injecting
+// the InterceptorAgent dylib into native apps. `macos_native_<cmd>` routes here.
+let nativeDomain = NativeDomain()
+
 // VM management. Registered against `vm` so `macos_vm_<verb>`
 // actions route here. Lives alongside ContainerDomain (which keeps
 // running the existing `macos_container_run` shell-out path).
@@ -119,6 +123,8 @@ router.register("log", handler: logDomain)
 router.register("script", handler: intentDomain)
 router.register("intent", handler: intentDomain)
 router.register("container", handler: containerDomain)
+// Runtime Agent surface: `macos_native_<cmd>` → NativeDomain.
+router.register("native", handler: nativeDomain)
 // register the new `vm` domain.
 router.register("vm", handler: vmDomain)
 
@@ -162,6 +168,9 @@ GlobalOverlayDomainRef.shared = overlayDomain
 signal(SIGINT) { _ in
     Platform.log("SIGINT received — shutting down")
     GlobalOverlayDomainRef.shared?.handle("stop", action: ["sub": "stop"]) { _ in }
+    // durably persist any buffered monitor events before exit.
+    MonitorEventWriter.shared.flush()
+    MonitorEventWriter.shared.closeAll()
     Thread.sleep(forTimeInterval: 0.1)
     Platform.cleanup()
     exit(0)
@@ -170,6 +179,9 @@ signal(SIGINT) { _ in
 signal(SIGTERM) { _ in
     Platform.log("SIGTERM received — shutting down")
     GlobalOverlayDomainRef.shared?.handle("stop", action: ["sub": "stop"]) { _ in }
+    // durably persist any buffered monitor events before exit.
+    MonitorEventWriter.shared.flush()
+    MonitorEventWriter.shared.closeAll()
     Thread.sleep(forTimeInterval: 0.1)
     Platform.cleanup()
     exit(0)
@@ -216,6 +228,13 @@ let updaterController = SPUStandardUpdaterController(
 let updateDomain = UpdateDomain(updaterController: updaterController)
 router.register("update", handler: updateDomain)
 Platform.log("sparkle updater started; feed: \(updaterController.updater.feedURL?.absoluteString ?? "unset")")
+
+// Extension Fabric: after EVERY built-in domain has registered (so the
+// collision check sees the full reserved set, including `update` above), scan
+// ~/.interceptor/extensions/*/manifest.json, verify + dlopen each operator-placed
+// bridge dylib, and register its prefix. Absent any extension this is a no-op and
+// the bridge is exactly the capability-blind host. Failures are isolated + logged.
+ExtensionFabric.loadAll(into: router)
 
 // Switched from `RunLoop.main.run()` to `app.run()`.
 // `RunLoop.main.run()` only spins the underlying CFRunLoop and does NOT

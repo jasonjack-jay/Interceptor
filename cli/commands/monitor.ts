@@ -30,6 +30,7 @@ import {
   resolveMonitorTaskId,
   snapshotMonitorTaskSources,
   stopMonitorTask,
+  repairMonitorTask,
   synthesizeMonitorTaskTranscript,
   validateMonitorTaskMode,
 } from "../../shared/monitor-tasks"
@@ -712,6 +713,9 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
         try {
           const taskId = resolveMonitorTaskId(flagValue(filtered, "--task"))
           const task = stopMonitorTask(taskId, { stopSourcesRequested: flagPresent(filtered, "--stop-sources") })
+          // auto-finalize: regenerate the transcript/segments so the
+          // done→export flow yields a graded, non-empty envelope with no extra steps.
+          synthesizeMonitorTaskTranscript(taskId)
           if (jsonMode) console.log(JSON.stringify(task, null, 2))
           else console.log(`${renderMonitorTaskStatus(task.taskId)}\n${renderMonitorTaskQualitySummary(task.taskId)}`)
           return null
@@ -741,8 +745,51 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
       }
       return { type: "monitor_status" }
 
+    case "repair": {
+      // the long-advertised `monitor repair`. Recovers any
+      // live-but-unattached sessions for the task, snapshots sources, transcribes
+      // offline audio, regenerates the timeline/transcript/segments, and re-grades.
+      if (!flagPresent(filtered, "--task")) {
+        console.error("error: interceptor monitor repair requires --task <taskId>")
+        process.exit(1)
+      }
+      try {
+        const taskId = resolveMonitorTaskId(flagValue(filtered, "--task"))
+        const { report, attached } = repairMonitorTask(taskId, {
+          snapshotSources: flagPresent(filtered, "--snapshot-sources"),
+          regenerate: !flagPresent(filtered, "--no-regenerate"),
+        })
+        if (jsonMode) {
+          console.log(JSON.stringify({ taskId, attached, report }, null, 2))
+        } else {
+          if (attached.length > 0) console.log(`recovered + attached ${attached.length} session(s): ${attached.join(", ")}`)
+          console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+        }
+        return null
+      } catch (err) {
+        console.error(`error: ${(err as Error).message}`)
+        process.exit(1)
+      }
+    }
+
     case "task": {
       const op = filtered[2]
+      if (op === "repair") {
+        const taskId = filtered[3]
+        if (!taskId) {
+          console.error("error: interceptor monitor task repair requires <taskId>")
+          process.exit(1)
+        }
+        try {
+          const { report, attached } = repairMonitorTask(taskId, { snapshotSources: true })
+          if (jsonMode) console.log(JSON.stringify({ taskId, attached, report }, null, 2))
+          else console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
       if (op === "attach") {
         const taskId = filtered[3]
         const sid = filtered[4]
@@ -816,7 +863,7 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
           process.exit(1)
         }
       }
-      console.error("error: unknown monitor task subcommand. Try: attach, snapshot, quality, diagnose, compile-blueprint")
+      console.error("error: unknown monitor task subcommand. Try: attach, snapshot, repair, quality, diagnose, compile-blueprint")
       process.exit(1)
     }
 
@@ -989,7 +1036,7 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
     }
 
     default:
-      console.error(`error: unknown monitor subcommand '${sub}'. Try: start, stop, status, pause, resume, tail, list, export.`)
+      console.error(`error: unknown monitor subcommand '${sub}'. Try: start, stop, status, pause, resume, repair, tail, list, export.`)
       process.exit(1)
   }
 }
@@ -1002,8 +1049,10 @@ Usage:
   interceptor monitor status [--task <taskId>]
   interceptor monitor pause
   interceptor monitor resume
+  interceptor monitor repair --task <taskId> [--snapshot-sources] [--no-regenerate]
   interceptor monitor task attach <taskId> <sessionId>
   interceptor monitor task snapshot <taskId>
+  interceptor monitor task repair <taskId>
   interceptor monitor task quality <taskId>
   interceptor monitor task compile-blueprint <taskId> [--force-diagnostic]
   interceptor monitor tail [--session <sid>] [--raw]
@@ -1018,6 +1067,7 @@ stop     End the active session and emit a summary.
 status   Show active sessions and counts, or a task envelope when --task is present.
 pause    Pause emission temporarily (does not unhook listeners).
 resume   Resume emission.
+repair   Recover unattached sessions for a task, snapshot sources, transcribe offline audio, regenerate timeline/transcript, and re-grade.
 task     Manage task-scoped source membership.
          snapshot copies source evidence under the task root; quality renders readiness gates; compile-blueprint enforces them.
 tail     Live tail of recorded events. Pretty by default; --raw for JSONL.

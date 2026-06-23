@@ -3,6 +3,9 @@ import ApplicationServices
 import AppKit
 import CoreGraphics
 import AVFoundation
+#if canImport(Speech)
+import Speech
+#endif
 
 // Trust response payload — schema lifted from Apple's AVAuthorizationStatus
 // vocabulary. Status values:
@@ -68,14 +71,19 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
         let accessibilityPrompt = !noPrompt && (action["accessibilityPrompt"] as? Bool ?? false)
         let screenPrompt = !noPrompt && (action["screenPrompt"] as? Bool ?? false)
         let microphonePrompt = !noPrompt && (action["microphonePrompt"] as? Bool ?? false)
+        // Speech Recognition is a distinct TCC service from
+        // Microphone. `macos trust speech --prompt` (or --speech-prompt) surfaces it.
+        let speechPrompt = !noPrompt && (action["speechPrompt"] as? Bool ?? false)
 
         let shouldPromptAccessibility = prompt || walkthrough || accessibilityPrompt
         let shouldPromptScreen = prompt || walkthrough || screenPrompt
         let shouldPromptMicrophone = prompt || walkthrough || microphonePrompt
+        let shouldPromptSpeech = prompt || walkthrough || speechPrompt
 
         let accessibilityStatus = checkAccessibility(prompt: shouldPromptAccessibility)
         let screenStatus = checkScreenRecording(prompt: shouldPromptScreen)
         let microphoneStatus = checkMicrophone(prompt: shouldPromptMicrophone)
+        let speechStatus = checkSpeech(prompt: shouldPromptSpeech)
 
         let displayName =
             (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
@@ -106,6 +114,14 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
                 path: "System Settings → Privacy & Security → Screen Recording → Enable \(displayName)",
                 reason: "Required for screenshots, screen capture, and vision analysis",
                 limitation: "Apple's CGPreflightScreenCaptureAccess returns Bool only; cannot distinguish denied from not_determined"
+            ),
+            Permission(
+                name: "Speech Recognition",
+                status: speechStatus,
+                required: false,
+                path: "System Settings → Privacy & Security → Speech Recognition → Enable \(displayName)",
+                reason: "Required for live speech-to-text during workflow capture (mac_monitor --include speech)",
+                limitation: nil
             )
         ]
 
@@ -123,6 +139,9 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
             } else if microphoneStatus != .granted {
                 openPrivacyPane("Privacy_Microphone")
                 openedPanes.append("Microphone")
+            } else if speechStatus != .granted {
+                openPrivacyPane("Privacy_SpeechRecognition")
+                openedPanes.append("Speech Recognition")
             }
         }
 
@@ -139,11 +158,15 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
         if shouldPromptMicrophone && microphoneStatus == .notDetermined {
             pendingUserAction.append("Microphone")
         }
+        if shouldPromptSpeech && speechStatus == .notDetermined {
+            pendingUserAction.append("Speech Recognition")
+        }
 
         var result: [String: Any] = [
             "accessibility": accessibilityStatus.rawValue,
             "screenRecording": screenStatus.rawValue,
             "microphone": microphoneStatus.rawValue,
+            "speechRecognition": speechStatus.rawValue,
             "permissions": permissions.map { $0.toDictionary() },
             "bundlePath": Bundle.main.bundlePath,
             "displayName": displayName
@@ -157,6 +180,7 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
         if shouldPromptAccessibility { prompted.append("Accessibility") }
         if shouldPromptScreen { prompted.append("Screen Recording") }
         if shouldPromptMicrophone { prompted.append("Microphone") }
+        if shouldPromptSpeech { prompted.append("Speech Recognition") }
         if !prompted.isEmpty {
             result["prompted"] = prompted
         }
@@ -271,6 +295,53 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
         // emit pending_user_action upstream.
         return microphoneProvider.currentStatus().permissionStatus
     }
+
+    // ── Speech Recognition ───────────────────────────────────────────────
+    // distinct TCC service from Microphone. Same LSUIElement
+    // activation-policy-upgrade trick as the mic prompt: a faceless .accessory
+    // agent can't reliably surface a TCC dialog, so go .regular for the request
+    // then back to .accessory. Authorization is requested with an actor-neutral
+    // closure (Apple may call it off the main queue; a @MainActor closure would
+    // crash). Defensively no-op if the usage string is missing — calling
+    // requestAuthorization without it CRASHES per Apple's docs.
+    #if canImport(Speech)
+    private func checkSpeech(prompt: Bool) -> PermissionStatus {
+        let current = speechPermissionStatus(SFSpeechRecognizer.authorizationStatus())
+        if current != .notDetermined { return current }
+        guard prompt else { return .notDetermined }
+        guard Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil else {
+            return .notDetermined
+        }
+
+        let isLiveBridge = Bundle.main.bundleIdentifier == "com.interceptor.bridge"
+        if isLiveBridge {
+            DispatchQueue.main.async {
+                NSApplication.shared.setActivationPolicy(.regular)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
+        }
+        SFSpeechRecognizer.requestAuthorization { _ in
+            if isLiveBridge {
+                DispatchQueue.main.async {
+                    NSApplication.shared.setActivationPolicy(.accessory)
+                }
+            }
+        }
+        return speechPermissionStatus(SFSpeechRecognizer.authorizationStatus())
+    }
+
+    private func speechPermissionStatus(_ status: SFSpeechRecognizerAuthorizationStatus) -> PermissionStatus {
+        switch status {
+        case .authorized: return .granted
+        case .denied: return .denied
+        case .restricted: return .restricted
+        case .notDetermined: return .notDetermined
+        @unknown default: return .notDetermined
+        }
+    }
+    #else
+    private func checkSpeech(prompt: Bool) -> PermissionStatus { .notDetermined }
+    #endif
 
     private func openPrivacyPane(_ anchor: String) {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") else {

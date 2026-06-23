@@ -19,7 +19,10 @@ import {
   readMonitorTaskMeta,
   readMonitorTaskSourceManifest,
   readMonitorTaskTranscriptSegments,
+  snapshotMonitorTaskSources,
   stopMonitorTask,
+  repairMonitorTask,
+  findLatestSessionSidForTask,
   synthesizeMonitorTaskTranscript,
   updateMonitorTaskMeta,
   validateSemanticTranscript,
@@ -444,5 +447,68 @@ describe("monitor task envelope", () => {
     expect(segments.every((segment) => !/^(browser|macos) event:/i.test(segment.title))).toBe(true)
     expect(quality.counts.rawTitleSegments).toBe(0)
     expect(quality.scores.transcriptCompression).toBe(1)
+  })
+
+  test("browser + macOS sessions attach to ONE envelope with SEPARATE source logs and a MERGED timeline", () => {
+    const task = createMonitorTask({ instruction: "image generation teach", mode: "human-teach" })
+    writeBrowserSession("task-browser")
+    writeMacosSession("task-macos")
+    attachMonitorTaskSource(task.taskId, "task-browser", { surface: "browser" })
+    attachMonitorTaskSource(task.taskId, "task-macos", { surface: "macos" })
+
+    const manifest = snapshotMonitorTaskSources(task.taskId)
+    expect(manifest.length).toBeGreaterThan(0)
+
+    // Separate source logs under per-sid snapshot dirs.
+    const browserDir = getMonitorTaskSourceSnapshotDir(task.taskId, "task-browser")
+    const macosDir = getMonitorTaskSourceSnapshotDir(task.taskId, "task-macos")
+    expect(browserDir).not.toBe(macosDir)
+    expect(existsSync(browserDir)).toBe(true)
+    expect(existsSync(macosDir)).toBe(true)
+
+    // One envelope, two sources.
+    const meta = readMonitorTaskMeta(task.taskId)!
+    expect(meta.sourceSessions.length).toBe(2)
+
+    // Unified timeline merges both surfaces.
+    const timeline = buildMonitorTaskTimeline(task.taskId)
+    expect(timeline.some((entry) => entry.surface === "browser")).toBe(true)
+    expect(timeline.some((entry) => entry.surface === "macos")).toBe(true)
+  })
+
+  test("monitor repair recovers an unattached macOS session and finalizes the envelope", () => {
+    const task = createMonitorTask({ instruction: "repair me", mode: "human-teach" })
+    // A live macOS session that names the task in its meta but never registered
+    // (the split-brain failure the PRD targets).
+    writeSessionMeta({
+      artifactVersion: 1,
+      surface: "macos",
+      sessionId: "task-macos",
+      startedAt: 2000,
+      status: "stopped",
+      endedAt: 2500,
+      paused: false,
+      taskId: task.taskId,
+      rootPid: 5,
+      rootApp: "Notes",
+      instruction: "repair me",
+      counts: { evt: 2, mut: 0, net: 0, nav: 0, ax: 1 },
+      attachments: [],
+      tcc: { accessibility: true },
+      scope: { mode: "all", apps: [] },
+      includes: [],
+      excludes: [],
+    })
+    appendSessionEvent("task-macos", { event: "mon_start", sid: "task-macos", surface: "macos", s: 0, t: 2000 })
+    appendSessionEvent("task-macos", { event: "window_focus", sid: "task-macos", surface: "macos", s: 1, t: 2100, app: "Notes", n: "Note" })
+
+    // Before repair: empty, but recoverable by sid scan.
+    expect(readMonitorTaskMeta(task.taskId)!.sourceSessions.length).toBe(0)
+    expect(findLatestSessionSidForTask(task.taskId)).toBe("task-macos")
+
+    const { report, attached } = repairMonitorTask(task.taskId, { snapshotSources: true })
+    expect(attached).toContain("task-macos")
+    expect(report.counts.sourceCount).toBe(1)
+    expect(report.status).not.toBe("not_usable")
   })
 })

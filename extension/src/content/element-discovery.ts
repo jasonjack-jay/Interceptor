@@ -40,8 +40,7 @@ export function walkWithShadow(root: Node, callback: (el: Element) => void) {
   }
 }
 
-export function isVisible(el: Element): boolean {
-  const style = getComputedStyle(el)
+export function isVisible(el: Element, style: CSSStyleDeclaration = getComputedStyle(el)): boolean {
   if (style.visibility === "hidden" || style.display === "none") return false
   const pos = style.position
   if (pos !== "fixed" && pos !== "sticky") {

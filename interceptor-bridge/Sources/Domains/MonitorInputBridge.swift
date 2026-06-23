@@ -34,15 +34,27 @@ final class MonitorInputBridge: @unchecked Sendable {
     private var includeMouseMoved = false
     private var excludeKey = false
 
+    // scroll coalescing. Within `scrollCoalesceMs`, accumulate
+    // scrollingDelta into one event carrying summed deltas + a sample count, so
+    // "log everything" stays full-fidelity (no lost direction/magnitude) without
+    // flooding the main run loop with one write per wheel tick. 0 = per-event.
+    private var scrollCoalesceMs = 0
+    private var scrollAccumX: Double = 0
+    private var scrollAccumY: Double = 0
+    private var scrollSamples = 0
+    private var scrollLatest: [String: Any]?
+    private var scrollFlushTimer: DispatchSourceTimer?
+
     func setCallback(_ cb: @escaping EventCallback) {
         lock.lock(); defer { lock.unlock() }
         callback = cb
     }
 
-    func start(includeMouseMoved: Bool = false, excludeKey: Bool = false) {
+    func start(includeMouseMoved: Bool = false, excludeKey: Bool = false, scrollCoalesceMs: Int = 0) {
         lock.lock()
         self.includeMouseMoved = includeMouseMoved
         self.excludeKey = excludeKey
+        self.scrollCoalesceMs = max(0, scrollCoalesceMs)
         lock.unlock()
 
         // Mask: clicks, scroll, key presses (when included), modifier flags
@@ -70,6 +82,11 @@ final class MonitorInputBridge: @unchecked Sendable {
     }
 
     func stop() {
+        flushScroll()
+        lock.lock()
+        scrollFlushTimer?.cancel()
+        scrollFlushTimer = nil
+        lock.unlock()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.lock.lock()
@@ -80,6 +97,50 @@ final class MonitorInputBridge: @unchecked Sendable {
                 NSEvent.removeMonitor(m)
             }
         }
+    }
+
+    // MARK: - scroll coalescing
+
+    private func accumulateScroll(dx: CGFloat, dy: CGFloat, base: [String: Any], coalesceMs: Int) {
+        lock.lock()
+        scrollAccumX += Double(dx)
+        scrollAccumY += Double(dy)
+        scrollSamples += 1
+        scrollLatest = base
+        let needTimer = scrollFlushTimer == nil
+        if needTimer {
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+            timer.schedule(deadline: .now() + .milliseconds(coalesceMs))
+            timer.setEventHandler { [weak self] in self?.flushScroll() }
+            scrollFlushTimer = timer
+            lock.unlock()
+            timer.resume()
+        } else {
+            lock.unlock()
+        }
+    }
+
+    private func flushScroll() {
+        lock.lock()
+        let cb = callback
+        let samples = scrollSamples
+        guard samples > 0, let cb = cb, var data = scrollLatest else {
+            scrollFlushTimer?.cancel()
+            scrollFlushTimer = nil
+            lock.unlock()
+            return
+        }
+        data["sx"] = scrollAccumX
+        data["sy"] = scrollAccumY
+        data["samples"] = samples
+        scrollAccumX = 0
+        scrollAccumY = 0
+        scrollSamples = 0
+        scrollLatest = nil
+        scrollFlushTimer?.cancel()
+        scrollFlushTimer = nil
+        lock.unlock()
+        cb("scroll", data)
     }
 
     // MARK: - dispatch
@@ -136,9 +197,14 @@ final class MonitorInputBridge: @unchecked Sendable {
             cb("mods", data)
 
         case .scrollWheel:
-            data["sx"] = event.scrollingDeltaX
-            data["sy"] = event.scrollingDeltaY
-            cb("scroll", data)
+            let coalesce = lock.withLock { self.scrollCoalesceMs }
+            if coalesce <= 0 {
+                data["sx"] = event.scrollingDeltaX
+                data["sy"] = event.scrollingDeltaY
+                cb("scroll", data)
+            } else {
+                accumulateScroll(dx: event.scrollingDeltaX, dy: event.scrollingDeltaY, base: data, coalesceMs: coalesce)
+            }
 
         case .mouseMoved:
             data["x"] = Int(NSEvent.mouseLocation.x)

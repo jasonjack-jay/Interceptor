@@ -1,5 +1,47 @@
-// @ts-expect-error ocrad.js does not ship TypeScript declarations
-import OCRAD from "ocrad.js/ocrad.js"
+import { createWorker, type Worker as TesseractWorker } from "tesseract.js"
+
+// ── Tesseract.js OCR (bundled WASM, fully offline, cross-platform) ────────────
+// Real pixel OCR for browser-only / non-macOS installs — no macOS Vision, no
+// agent round-trip, returns a deterministic text string. The WASM core, worker
+// and English language data are bundled under extension/tesseract/ and loaded
+// from extension-local URLs (no CDN, works on any page CSP). Lazy-initialized:
+// nothing loads until the first `ocr` request.
+let ocrWorker: TesseractWorker | null = null
+let ocrWorkerInit: Promise<TesseractWorker> | null = null
+
+async function getOcrWorker(): Promise<TesseractWorker> {
+  if (ocrWorker) return ocrWorker
+  if (!ocrWorkerInit) {
+    const base = chrome.runtime.getURL("tesseract/")
+    ocrWorkerInit = createWorker("eng", 1, {
+      workerPath: `${base}worker.min.js`,
+      workerBlobURL: false,
+      corePath: base,
+      langPath: base,
+      // Language data is bundled; don't try to cache/refetch from a CDN.
+      cacheMethod: "none",
+      gzip: true
+    }).then((w) => { ocrWorker = w; return w })
+  }
+  return ocrWorkerInit
+}
+
+async function ocrImage(dataUrl: string) {
+  try {
+    const worker = await getOcrWorker()
+    const { data } = await worker.recognize(dataUrl)
+    return {
+      success: true,
+      data: {
+        text: (data.text || "").replace(/[ \t]+\n/g, "\n").trim(),
+        source: "tesseract",
+        confidence: typeof data.confidence === "number" ? data.confidence : null
+      }
+    }
+  } catch (e) {
+    return { success: false, error: `tesseract OCR failed: ${(e as Error).message}` }
+  }
+}
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.target !== "offscreen") return
@@ -9,16 +51,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       cropImage(msg.dataUrl, msg.clip).then(sendResponse)
       return true
 
+    case "ocr":
+      ocrImage(msg.dataUrl).then(sendResponse)
+      return true
+
     case "stitch":
       stitchImages(msg.strips, msg.totalWidth, msg.totalHeight, msg.format, msg.quality).then(sendResponse)
       return true
 
     case "diff":
       diffImages(msg.image1, msg.image2, msg.threshold, msg.returnImage).then(sendResponse)
-      return true
-
-    case "ocr":
-      ocrImage(msg.dataUrl).then(sendResponse)
       return true
 
     case "capture_start":
@@ -168,29 +210,6 @@ async function diffImages(image1: string, image2: string, threshold: number, ret
     }
 
     return { success: true, data: result }
-  } catch (e) {
-    return { success: false, error: (e as Error).message }
-  }
-}
-
-async function ocrImage(dataUrl: string) {
-  try {
-    const img = await loadImage(dataUrl)
-    const canvas = document.createElement("canvas")
-    canvas.width = img.naturalWidth || img.width
-    canvas.height = img.naturalHeight || img.height
-    const ctx = canvas.getContext("2d", { willReadFrequently: true })
-    if (!ctx) throw new Error("2d context unavailable")
-    ctx.drawImage(img, 0, 0)
-    const text = OCRAD(canvas)
-    return {
-      success: true,
-      data: {
-        text,
-        source: "ocrad-offscreen",
-        confidence: null
-      }
-    }
   } catch (e) {
     return { success: false, error: (e as Error).message }
   }

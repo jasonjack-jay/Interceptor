@@ -29,7 +29,20 @@ import { handleDomScreenshot } from "./content/dom-screenshot"
 type Action = { type: string; [key: string]: unknown }
 type ActionResult = { success: boolean; error?: string; warning?: string; data?: unknown; changes?: unknown }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// Idempotency guard. content.js is injected by the manifest at document_idle AND
+// re-injected programmatically (chrome.scripting.executeScript) on retry / eager
+// paths — e.g. `interceptor open` reading a fresh tab before document_idle fires.
+// Both injections share this frame's isolated world, so without a guard the page
+// accrues TWO action listeners and every action runs twice. That double-dispatch
+// was historically masked (isolated-world synthetic clicks rarely drove framework
+// handlers), but once clicks are bridged to the page MAIN world a doubled click
+// toggles pointerdown-driven menus (Radix / Floating UI) right back shut. Register
+// the action listener (and the keepalive) only on the first load in this world.
+const __interceptorContentGlobal = globalThis as unknown as { __interceptorContentLoaded?: boolean }
+const __interceptorContentAlreadyLoaded = __interceptorContentGlobal.__interceptorContentLoaded === true
+__interceptorContentGlobal.__interceptorContentLoaded = true
+
+if (!__interceptorContentAlreadyLoaded) chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "execute_action") {
     handleAction(msg.action)
       .then(sendResponse)
@@ -215,7 +228,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
 
 // --- SW Keepalive Heartbeat (leader-elected, zero network) ---
 let _swKeepaliveLeader = true
-setInterval(() => {
+if (!__interceptorContentAlreadyLoaded) setInterval(() => {
   if (!_swKeepaliveLeader) return
   try {
     chrome.runtime.sendMessage({ type: "sw_keepalive" })

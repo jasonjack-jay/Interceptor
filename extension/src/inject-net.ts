@@ -61,6 +61,40 @@ if ((window as any).__interceptor_net_installed) {
     }
   }) as EventListener)
 
+  // Main-world gesture dispatch. Synthetic pointer events fired from the content
+  // script's ISOLATED world don't drive some frameworks' `pointerdown` handlers
+  // (Radix / Floating UI menus open on pointerdown but ignore isolated-world
+  // events). The content script bridges here by dispatching an
+  // `__interceptor_click` CustomEvent on the target; we re-fire the gesture in
+  // the MAIN world — where the page's own listeners treat it as a real event —
+  // tagging each event trusted, and ack synchronously so the isolated side knows
+  // it does not need its legacy fallback dispatch.
+  document.addEventListener("__interceptor_click", ((e: CustomEvent) => {
+    const target = e.target as (Element & { focus?: () => void }) | null
+    if (!target || typeof (target as Element).dispatchEvent !== "function") return
+    const d = (e.detail || {}) as { x?: number; y?: number }
+    const base = {
+      bubbles: true, cancelable: true, composed: true,
+      clientX: d.x ?? 0, clientY: d.y ?? 0,
+      button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true,
+    }
+    const fire = (ev: Event) => {
+      (ev as Event & { __interceptor_trust?: boolean }).__interceptor_trust = true
+      target.dispatchEvent(ev)
+    }
+    try {
+      fire(new PointerEvent("pointerover", { ...base, buttons: 1 }))
+      fire(new MouseEvent("mouseover", { ...base, buttons: 1 }))
+      fire(new PointerEvent("pointerdown", { ...base, buttons: 1 }))
+      fire(new MouseEvent("mousedown", { ...base, buttons: 1 }))
+      try { target.focus?.() } catch {}
+      fire(new PointerEvent("pointerup", { ...base, buttons: 0 }))
+      fire(new MouseEvent("mouseup", { ...base, buttons: 0 }))
+      fire(new MouseEvent("click", { ...base, buttons: 0 }))
+      target.dispatchEvent(new CustomEvent("__interceptor_click_ack", { bubbles: true }))
+    } catch {}
+  }) as EventListener, true)
+
   function applyOverrides(rawUrl: string): string {
     if (!overrideRules.length) return rawUrl
     for (const rule of overrideRules) {
@@ -642,7 +676,7 @@ if ((window as any).__interceptor_net_installed) {
       })
 
       const originalSend = real.send.bind(real)
-      real.send = function (data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+      real.send = function (data: Parameters<WebSocket["send"]>[0]): void {
         dispatchPageComm({
           type: "ws",
           event: "ws_send",

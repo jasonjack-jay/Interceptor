@@ -134,35 +134,35 @@ async function reloadTabForCspRetry(tabId: number): Promise<void> {
   await waitForTabLoad(tabId, 15_000)
 }
 
-export async function handleEvaluateActions(
-  action: { type: string; [key: string]: unknown },
-  tabId: number
+/**
+ * Run a per-tab evaluation through the CSP / Trusted-Types escalation chain:
+ *   1. try the `run` callback in the requested world
+ *   2. on a Trusted-Types-only failure (MAIN), retry in ISOLATED
+ *   3. on any unsafe-eval CSP / TT failure (MAIN), strip the page's CSP response
+ *      header via a per-tab declarativeNetRequest rule + reload, then retry
+ *
+ * `run` performs the actual in-page work and returns an ActionResult — e.g.
+ * clone-eval for the `evaluate` capability, or blob-URL normalization for the
+ * binary sink. On the fallback / bypass paths the successful result's `data` is
+ * wrapped as `{ value, trustedTypesFallback | cspBypassApplied, originalError }`;
+ * callers that need the raw value should unwrap `data.value` when present.
+ *
+ * This is the shared bypass core (lifted out of handleEvaluateActions) so every
+ * capability that evals into a page inherits the same strict-CSP / Trusted-Types
+ * handling instead of reimplementing a weaker one.
+ */
+export async function runWithCspStripBypass(
+  tabId: number,
+  world: "MAIN" | "ISOLATED",
+  run: (tabId: number, world: "MAIN" | "ISOLATED") => Promise<ActionResult>
 ): Promise<ActionResult> {
-  if (action.type !== "evaluate") {
-    return { success: false, error: `unknown evaluate action: ${action.type}` }
-  }
-  const code = action.code as string
-  const world = (action.world as string) === "ISOLATED" ? "ISOLATED" : "MAIN"
-  const initialUserScriptWorld = world === "MAIN" ? "MAIN" : "USER_SCRIPT"
-  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code)
-  if (userScriptAttempt.available) {
-    if (
-      !userScriptAttempt.result?.success &&
-      world === "MAIN" &&
-      isCspEvalError(userScriptAttempt.result?.error)
-    ) {
-      const fallback = await executeWithUserScripts(tabId, "USER_SCRIPT", code)
-      if (fallback.available) return fallback.result ?? { success: false, error: "no result" }
-    }
-    return userScriptAttempt.result ?? { success: false, error: "no result" }
-  }
-  const first = await executeEval(tabId, world as "MAIN" | "ISOLATED", code)
+  const first = await run(tabId, world)
   if (first.success || world !== "MAIN") {
     return first
   }
 
   if (isTrustedTypesError(first.error) && !isCspUnsafeEvalError(first.error)) {
-    const isolated = await executeEval(tabId, "ISOLATED", code)
+    const isolated = await run(tabId, "ISOLATED")
     if (isolated.success) {
       return {
         ...isolated,
@@ -173,17 +173,14 @@ export async function handleEvaluateActions(
         }
       }
     }
-    return {
-      success: false,
-      error: isolated.error || first.error,
-      data: {
-        originalError: first.error,
-        trustedTypesFallbackAttempted: true
-      }
-    }
+    // ISOLATED also failed under Trusted Types (require-trusted-types-for
+    // 'script' blocks eval in every world). Fall through to the CSP-strip
+    // bypass + reload path below — buildCspBypassRule removes the entire CSP
+    // response header (including require-trusted-types-for), so a reloaded page
+    // accepts MAIN-world eval.
   }
 
-  if (!isCspUnsafeEvalError(first.error)) {
+  if (!isCspUnsafeEvalError(first.error) && !isTrustedTypesError(first.error)) {
     return first
   }
 
@@ -198,7 +195,7 @@ export async function handleEvaluateActions(
     }
   }
 
-  const retried = await executeEval(tabId, "MAIN", code)
+  const retried = await run(tabId, "MAIN")
   if (retried.success) {
     return {
       ...retried,
@@ -218,4 +215,45 @@ export async function handleEvaluateActions(
       cspBypassApplied: true
     }
   }
+}
+
+export async function handleEvaluateActions(
+  action: { type: string; [key: string]: unknown },
+  tabId: number
+): Promise<ActionResult> {
+  if (action.type !== "evaluate") {
+    return { success: false, error: `unknown evaluate action: ${action.type}` }
+  }
+  const code = action.code as string
+  const world = (action.world as string) === "ISOLATED" ? "ISOLATED" : "MAIN"
+  const initialUserScriptWorld = world === "MAIN" ? "MAIN" : "USER_SCRIPT"
+  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code)
+  if (userScriptAttempt.available) {
+    if (
+      !userScriptAttempt.result?.success &&
+      world === "MAIN" &&
+      isCspEvalError(userScriptAttempt.result?.error)
+    ) {
+      const fallback = await executeWithUserScripts(tabId, "USER_SCRIPT", code)
+      if (
+        fallback.available &&
+        (fallback.result?.success || !isCspEvalError(fallback.result?.error))
+      ) {
+        return fallback.result ?? { success: false, error: "no result" }
+      }
+      // userScripts could not beat the page's CSP / Trusted-Types either — fall
+      // through to the executeEval CSP-strip bypass + reload path below.
+    } else {
+      return userScriptAttempt.result ?? { success: false, error: "no result" }
+    }
+  }
+  // Trusted-Types / unsafe-eval CSP escalation now lives in the shared
+  // runWithCspStripBypass core (see above) so `evaluate` and the binary sink
+  // share one bypass implementation. The userScripts attempt above remains
+  // evaluate-specific.
+  return runWithCspStripBypass(
+    tabId,
+    world as "MAIN" | "ISOLATED",
+    (t, w) => executeEval(t, w, code)
+  )
 }

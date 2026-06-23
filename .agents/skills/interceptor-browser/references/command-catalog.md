@@ -101,6 +101,29 @@ interceptor net monitor off
 Use `net monitor on --reload` when the WebSocket or BroadcastChannel is created
 during page startup. For mechanics and limits, see `page-communication-capture.md`.
 
+## Byte Export
+
+Save page-produced bytes without CDP, browser downloads, Save dialogs, or
+clipboard:
+
+```bash
+interceptor save --json --context <ctx> --tab <id> --out /abs/path/file.bin "window.someBlobOrUint8Array"
+interceptor save --json --context <ctx> --tab <id> --out /abs/path/file.bin "blob:https://example.com/..."
+interceptor save --json --context <ctx> --tab <id> --out /abs/path/file.txt "new Blob([text], {type:'text/plain'})"
+```
+
+Supported expression results: `Blob`, `File`, `ArrayBuffer`, typed arrays,
+`blob:` URL strings, and objects with `url`/`blobUrl`/`href`. Use an absolute
+output path (the sink writes anywhere the daemon's user can write).
+
+`save` must be the **first token** so the CLI auto-selects the WebSocket sink
+path. Other flags (`--json`, `--context`, `--tab`, `--isolated`, `--chunk-size`)
+may now appear in any position — the parser keeps them out of the evaluated
+expression. The response includes `sha256`, `bytes`, and `chunks`; the daemon
+discards the file and fails if the written byte count doesn't match the source,
+so a reported success is integrity-checked. Strict-CSP / Trusted-Types pages
+work too — `save` reuses the same CSP-strip + reload bypass as `eval`.
+
 ## Canvas
 
 ```bash
@@ -114,8 +137,10 @@ Pixels only when observer data is insufficient:
 ```bash
 interceptor canvas read 1 [--format png] [--region 10,20,300,120] [--webgl]
 interceptor canvas diff 1
-interceptor canvas ocr 1                           # Experimental — fallback only
+interceptor canvas ocr 1                           # Native canvas text: aria/fallback + semantic model (no pixel OCR)
 ```
+
+`canvas ocr` returns the canvas's *native* accessible text (aria-label / aria-labelledby / fallback subtree / figcaption) plus the page's semantic textbox model — no pixel OCR. For a canvas-rendered editor prefer `scene text`; for genuine pixel-only text use `interceptor macos vision text` (native macOS Vision OCR).
 
 Canvas indexes are DOM canvas indexes.
 
@@ -217,6 +242,15 @@ Primary use case: two Chrome profiles logged in to different accounts simultaneo
 interceptor capabilities                            # Available input layers
 interceptor reload                                  # After extension changes during dev
 ```
+
+## Branding (white-label)
+
+```bash
+interceptor brand tab-group --title "Acme"                # Rename the managed tab group at runtime
+interceptor brand tab-group --title "Acme" --color blue   # Title + color (grey|blue|red|yellow|green|pink|purple|cyan|orange)
+```
+
+Runtime-configurable — no rebuild, no options page. Resolved from `chrome.storage` (precedence `managed` > `local` > built-in default `interceptor`/`cyan`) and applied live to the tab-strip group. Settable here, from the toolbar popup, or via an enterprise managed policy.
 
 ## Eval (escape hatch)
 

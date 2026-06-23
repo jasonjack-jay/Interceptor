@@ -44,6 +44,31 @@ export function parseScreenshotCommand(filtered: string[]): Action {
       return ssAction
     }
 
+    case "ocr": {
+      // interceptor ocr "<css-selector>" | <ref> | --element N | --region X,Y,W,H
+      // Renders the target via the native screenshot path, then OCRs it with the
+      // bundled Tesseract engine (offline, cross-platform, no Mac, no agent).
+      const a: Action = { type: "ocr" }
+      const pos = filtered[1]
+      if (pos && !pos.startsWith("--")) {
+        if (/^e\d/.test(pos)) a.ref = pos
+        else a.selector = pos
+      }
+      if (filtered.includes("--selector")) a.selector = filtered[filtered.indexOf("--selector") + 1]
+      if (filtered.includes("--ref")) a.ref = filtered[filtered.indexOf("--ref") + 1]
+      if (filtered.includes("--element")) a.element = parseInt(filtered[filtered.indexOf("--element") + 1])
+      if (filtered.includes("--region")) {
+        const rp = filtered[filtered.indexOf("--region") + 1].split(",").map(Number)
+        a.region = { x: rp[0], y: rp[1], width: rp[2], height: rp[3] }
+      }
+      if (filtered.includes("--scale")) a.scale = parseFloat(filtered[filtered.indexOf("--scale") + 1])
+      if (filtered.includes("--target-max-long-edge")) {
+        const parsed = parseInt(filtered[filtered.indexOf("--target-max-long-edge") + 1])
+        if (Number.isFinite(parsed) && parsed > 0) a.target_max_long_edge = parsed
+      }
+      return a
+    }
+
     case "canvas":
       switch (filtered[1]) {
         case "list":

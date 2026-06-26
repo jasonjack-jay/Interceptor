@@ -83,6 +83,16 @@ function runInstallDryRun(args: string[]): { stdout: string; status: number; std
 }
 
 describe("install modes — dry-run", () => {
+  test("install.sh is valid bash syntax", () => {
+    const proc = spawnSync("bash", ["-n", INSTALL_SCRIPT], {
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    })
+    expect(proc.status).toBe(0)
+    expect(proc.stderr ?? "").toBe("")
+  })
+
   test("--browser-only prints browser steps but never bridge steps", () => {
     const { stdout, status } = runInstallDryRun(["--browser-only", "--chrome"])
     expect(status).toBe(0)
@@ -310,7 +320,7 @@ describe("install branded-Chromium messaging — static checks", () => {
     expect(src).toContain('"$target" == "edge"')
     expect(src).toContain("ignores --load-extension in branded desktop builds")
     // Developer flow URL substitution must be present for Edge.
-    expect(src).toMatch(/SCHEMA="edge"/)
+    expect(src).toContain('edge) echo "edge://extensions/"')
   })
 })
 

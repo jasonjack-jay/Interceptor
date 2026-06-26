@@ -107,6 +107,16 @@ browser_bin_for() {
   esac
 }
 
+extensions_url_for() {
+  case "$1" in
+    brave) echo "brave://extensions/" ;;
+    chrome|chrome-beta|chrome-canary|chrome-dev|chrome-for-testing) echo "chrome://extensions/" ;;
+    edge) echo "edge://extensions/" ;;
+    vivaldi) echo "vivaldi://extensions/" ;;
+    *) echo "chrome://extensions/" ;;
+  esac
+}
+
 # ── Parse flags ────────────────────────────────────────────────────────────────
 SKIP_EXTENSION=0
 BROWSER=""
@@ -529,6 +539,30 @@ load_extension() {
     return 0
   fi
 
+  # Chrome stable / Beta / Canary / Dev and Edge (all branded Chromium builds)
+  # ignore --load-extension on macOS and Windows desktop. Surface the
+  # developer-flow remediation rather than launch a no-op. Brave, Vivaldi, and
+  # Chrome for Testing (an unbranded Google-built testing variant) respect
+  # --load-extension and fall through to the launch path below.
+  if [[ "$target" == "chrome" || "$target" == "chrome-beta" \
+     || "$target" == "chrome-canary" || "$target" == "chrome-dev" \
+     || "$target" == "edge" ]]; then
+    local EXTENSIONS_URL
+    EXTENSIONS_URL="$(extensions_url_for "$target")"
+    echo ""
+    echo "==> $BROWSER_NAME ignores --load-extension in branded desktop builds."
+    echo "    Native messaging metadata has already been installed."
+    echo ""
+    echo "    If Interceptor is not already listed at $EXTENSIONS_URL:"
+    echo "      1. Open $EXTENSIONS_URL"
+    echo "      2. Enable Developer Mode"
+    echo "      3. Load unpacked -> $EXTENSION_DIR"
+    echo ""
+    echo "    For a non-Default profile, re-run with --profile <directory>, e.g.:"
+    echo "      bash scripts/install.sh ${MODE:+--$MODE} --$target --profile \"Profile 1\""
+    return 0
+  fi
+
   # ── Developer-mode preflight ─────────────────────────────────────────────────
   # Chromium silently drops --load-extension when the target profile has Dev
   # mode off — the launch reports success, the extension is dormant, and every
@@ -541,6 +575,8 @@ load_extension() {
   local PREFS_PATH="$PROFILE_PATH/Preferences"
   local DEVMODE_STATE
   DEVMODE_STATE="$(read_developer_mode "$PREFS_PATH")"
+  local EXTENSIONS_URL
+  EXTENSIONS_URL="$(extensions_url_for "$target")"
 
   if [[ "$DEVMODE_STATE" == "false" || "$DEVMODE_STATE" == "unknown" ]]; then
     echo ""
@@ -553,7 +589,9 @@ load_extension() {
     echo ""
     echo "    Manual remediation:"
     echo "      1. Quit $BROWSER_NAME entirely."
-    echo "      2. Re-launch $BROWSER_NAME, open $(case "$target" in brave) echo brave://extensions/ ;; chrome|chrome-beta|chrome-canary|chrome-dev|chrome-for-testing) echo chrome://extensions/ ;; edge) echo edge://extensions/ ;; vivaldi) echo vivaldi://extensions/ ;; esac), toggle Developer mode ON."
+    echo "      2. Re-launch $BROWSER_NAME, open $EXTENSIONS_URL, toggle Developer mode ON."
+    echo "         If you use a non-Default Chrome profile, re-run with:"
+    echo "         bash scripts/install.sh ${MODE:+--$MODE} --$target --profile \"Profile 2\""
     echo "      3. Quit $BROWSER_NAME again."
     echo "      4. Re-run: bash scripts/install.sh ${MODE:+--$MODE} --$target${PROFILE:+ --profile \"$PROFILE\"}"
 
@@ -584,6 +622,9 @@ load_extension() {
       echo ""
       echo "    Auto-enable is unavailable (no Preferences file at '$PREFS_PATH'"
       echo "    or $BROWSER_NAME is still running). Use the manual path."
+      echo ""
+      echo "    Tip: list profile directories with:"
+      echo "      bash scripts/install.sh --$target --profiles"
       exit 1
     else
       # Non-interactive: hard-fail loudly so a wrapper doesn't ship a dormant install.
@@ -628,29 +669,6 @@ load_extension() {
       echo "    Skipping extension loading."
       return 0
     fi
-  fi
-
-  # Chrome stable / Beta / Canary / Dev and Edge (all branded Chromium builds)
-  # ignore --load-extension on macOS and Windows desktop. Surface the
-  # developer-flow remediation rather than launch a no-op. Brave, Vivaldi, and
-  # Chrome for Testing (an unbranded Google-built testing variant) respect
-  # --load-extension and fall through to the launch path below.
-  if [[ "$target" == "chrome" || "$target" == "chrome-beta" \
-     || "$target" == "chrome-canary" || "$target" == "chrome-dev" \
-     || "$target" == "edge" ]]; then
-    local SCHEMA
-    case "$target" in
-      chrome|chrome-beta|chrome-canary|chrome-dev) SCHEMA="chrome" ;;
-      edge)                                        SCHEMA="edge" ;;
-    esac
-    echo ""
-    echo "==> $BROWSER_NAME ignores --load-extension in branded desktop builds."
-    echo "    Use one of these paths instead:"
-    echo "      1. Developer flow: open ${SCHEMA}://extensions, enable Developer Mode,"
-    echo "         then Load unpacked -> $EXTENSION_DIR"
-    echo ""
-    echo "    Native messaging metadata has already been installed."
-    return 0
   fi
 
   echo ""
